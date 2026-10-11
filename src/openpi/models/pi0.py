@@ -62,14 +62,33 @@ def posemb_sincos(
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
-
+# PI0 模型
 class Pi0(_model.BaseModel):
-    def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
-        super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+
+    def __init__(
+        self, 
+        # PI0 配置参数
+        config: pi0_config.Pi0Config, 
+        # 根据 JAX 的随机数密钥 rng，创建一个用于管理随机数密钥的对象 rngs，供后续模型初始化等操作使用
+        rngs: nnx.Rngs
+    ):
+
+        # 调用父类的初始化函数
+        super().__init__(
+            config.action_dim,      # 动作维度：一个动作需要多少个部分共同完成
+            config.action_horizon,  # 动作序列长度：一次预测产生的动作数量
+            config.max_token_len    # 最大 token 数：语言提示可最多包含的 token 数
+        )
+
+        # 是否启用 PI05 模型（Bool)
         self.pi05 = config.pi05
+
+        # 根据 Pi0Config 中指定的模型配置名称，获取 PaliGemma 主干模型的配置
         paligemma_config = _gemma.get_config(config.paligemma_variant)
+
+        # 根据 Pi0Config 中指定的模型配置名称，获取 Action Expert 动作专家的配置
         action_expert_config = _gemma.get_config(config.action_expert_variant)
-        # TODO: rewrite gemma in NNX. For now, use bridge.
+
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],

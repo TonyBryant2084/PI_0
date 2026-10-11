@@ -274,24 +274,39 @@ class BaseModelConfig(abc.ABC):
 #      对于未声明默认值的字段，通常不能直接通过类名访问其值
 #      创建实例并赋值后，可以通过实例访问该属性
 @dataclasses.dataclass
+# abc.ABC：Abstract Base Classes 抽象基类
 class BaseModel(nnx.Module, abc.ABC):
 
+    # 动作维度：一个动作需要多少个部分共同完成
     action_dim: int
+
+    # 动作序列长度：一次预测产生的动作数量
     action_horizon: int
+
+    # 最大 token 数：语言提示可最多包含的 token 数
     max_token_len: int
 
+    # 抽象类
     @abc.abstractmethod
+    # 根据观测信息和真实动作计算损失
     def compute_loss(
         self,
-        rng: at.KeyArrayLike,
-        observation: Observation,
-        actions: Actions,
-        *,
-        train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]: ...
+        rng: at.KeyArrayLike,              # JAX 随机数密钥，用于生成随机数
+        observation: Observation,          # 视觉语言模型的输入
+        actions: Actions,                  # 真实动作数据
+        *,                                 # 前者参数位置传参和关键字传参都可以，后者只能关键字传参
+        train: bool = False,               # 是否处于训练模式
+    ) -> at.Float[at.Array, "*b ah"]: ...  # 返回浮点类型损失张量，shape：[batch_size, action_horizon]，*b 表示批次维度可以有零个、一个或多个，具体有多少个维度由实际输入决定
 
+    # 抽象类
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
+    # 根据观测信息生成动作序列
+    def sample_actions(
+        self,  
+        rng: at.KeyArrayLike,      # JAX 随机数密钥，用于生成随机数
+        observation: Observation,  # 视觉语言模型的输入 
+        **kwargs                   # 接收额外的关键字参数
+    ) -> Actions: ...              # 返回模型生成的动作序列
 
 
 def restore_params(

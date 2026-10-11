@@ -38,81 +38,155 @@ import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
+# Paligemma 的词表大小：257152
 PALIGEMMA_VOCAB_SIZE = 257_152
 
-
+# @dataclasses.dataclass：
+#   1) Python 标准库提供的通用数据类装饰器，适用于普通 Python 程序
+#
+#   2) 自动生成 __init__() 等常用方法，简化类的定义
+#
+#   3) 类中声明的字段会被识别为 dataclass 字段，例如：
+#      dtype: str = "bfloat16"
+#      其中 dtype 是字段名，str 是类型标注，"bfloat16" 是默认值
+#
+#   4) 创建实例时，自动生成的 __init__() 会将传入的参数赋给实例属性
+#      如果没有传入对应参数，则使用字段声明中的默认值（前提是该字段有默认值）
+#
+#   5) 对于声明了默认值的字段，通常可以通过类名访问其默认值
+#      对于未声明默认值的字段，通常不能直接通过类名访问其值
+#      创建实例并赋值后，可以通过实例访问该属性
 @dataclasses.dataclass
 class Config:
+
+    # Transformer 隐藏层的维度，即每个 Token 对应的特征向量维度
     width: int
+
+    # Transformer 的层数，即模型中堆叠的 Transformer Block 数量
     depth: int
+
+    # 前馈神经网络（MLP）的中间隐藏层维度
     mlp_dim: int
+
+    # Query（查询向量）的注意力头数量
     num_heads: int
+
+    # Key（键向量）和 Value（值向量）的注意力头数量
     num_kv_heads: int
+
+    # 每个注意力头的特征维度
     head_dim: int
+
+    # LoRA 的配置：
+    # 1. 对于不可变对象（str、int、float、tuple）：可以直接写 = "默认值"，因为它们无法被修改，只能被替换，不会互相影响。
+    # 2. 对于可变对象（list、dict、set）：不能直接写 = [] 或 = {}，否则所有实例会共享同一个对象，改一个就全改了。
+    # 3. 使用 dataclasses.field(default_factory=dict)：每次新建实例时自动调用 dict() 生成一个全新的空字典，确保每个实例都有独立的字典，互不干扰
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
+# 模型变体名
+# Literal[...]：限定该类型只能取这几个固定字符串之一
+Variant = Literal[
+    "dummy",           # 测试用超小模型
+    "gemma_300m",      # 约 3.11 亿参数的模型
+    "gemma_300m_lora", # 约 3.11 亿参数的模型，支持 LoRA
+    "gemma_2b",        # 约 20 亿参数的模型
+    "gemma_2b_lora",   # 约 20 亿参数的模型，支持 LoRA
+]
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
 
-
+# 根据模型变体名称获取对应的配置参数
 def get_config(variant: Variant) -> Config:
-    """Returns config for specified gemma variant."""
+
+    # 测试用超小模型
     if variant == "dummy":
         return Config(
-            width=64,
-            depth=4,
-            mlp_dim=128,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=16,
+            width=64,       # 隐藏层维度：每个 Token 的特征向量维度
+            depth=4,        # Transformer 层数：堆叠的 Transformer Block 数量
+            mlp_dim=128,    # MLP 中间层维度
+            num_heads=8,    # Query（查询向量）的注意力头数量
+            num_kv_heads=1, # Key（键向量）和 Value（值向量）的注意力头数量
+            head_dim=16,    # 每个注意力头的特征维度
         )
+
+    # 约 3.11 亿参数的模型
     if variant == "gemma_300m":
-        # 311M params
         return Config(
-            width=1024,
-            depth=18,
-            mlp_dim=4096,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-        )
+            width=1024,      # 隐藏层维度
+            depth=18,        # Transformer 层数
+            mlp_dim=4096,    # MLP 中间层维度
+            num_heads=8,     # Query（查询向量）的注意力头数量
+            num_kv_heads=1,  # Key（键向量）和 Value（值向量）的注意力头数量
+            head_dim=256,    # 每个注意力头的特征维度
+        )  # 模型参数量约为 311M，即 3.11 亿
+
+    # 约 3.11 亿参数的模型，支持 LoRA
+    if variant == "gemma_300m_lora":
+        return Config(
+            width=1024,      # 隐藏层维度
+            depth=18,        # Transformer 层数
+            mlp_dim=4096,    # MLP 中间层维度
+            num_heads=8,     # Query（查询向量）的注意力头数量
+            num_kv_heads=1,  # Key（键向量）和 Value（值向量）的注意力头数量
+            head_dim=256,    # 每个注意力头的特征维度
+            # LoRA 配置
+            lora_configs={
+                # Attention 的 LoRA 配置：秩为 32，缩放参数为 32.0
+                "attn": lora.LoRAConfig(rank=32, alpha=32.0),  
+                # FeedForward 的 LoRA 配置：秩为 32，缩放参数为 32.0
+                "ffn": lora.LoRAConfig(rank=32, alpha=32.0),   
+            },
+        ) 
+
+    # 约 20 亿参数的模型
     if variant == "gemma_2b":
         return Config(
-            width=2048,
-            depth=18,
-            mlp_dim=16_384,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
+            width=2048,      # 隐藏层维度
+            depth=18,        # Transformer 层数
+            mlp_dim=16_384,  # MLP 中间层维度
+            num_heads=8,     # Query（查询向量）的注意力头数量
+            num_kv_heads=1,  # Key（键向量）和 Value（值向量）的注意力头数量
+            head_dim=256,    # 每个注意力头的特征维度
         )
+
+    # 约 20 亿参数的模型，支持 LoRA
     if variant == "gemma_2b_lora":
         return Config(
-            width=2048,
-            depth=18,
-            mlp_dim=16_384,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+            width=2048,      # 隐藏层维度
+            depth=18,        # Transformer 层数
+            mlp_dim=16_384,  # MLP 中间层维度
+            num_heads=8,     # Query（查询向量）的注意力头数量
+            num_kv_heads=1,  # Key（键向量）和 Value（值向量）的注意力头数量
+            head_dim=256,    # 每个注意力头的特征维度
+            # LoRA 配置
+            lora_configs={
+                # Attention 的 LoRA 配置：秩为 16，缩放参数为 16.0
+                "attn": lora.LoRAConfig(rank=16, alpha=16.0),  
+                # FeedForward 的 LoRA 配置：秩为 16，缩放参数为 16.0
+                "ffn": lora.LoRAConfig(rank=16, alpha=16.0),   
+            },
         )
-    if variant == "gemma_300m_lora":
-        # 311M params
-        return Config(
-            width=1024,
-            depth=18,
-            mlp_dim=4096,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
-        )
-    raise ValueError(f"Unknown variant: {variant}")
 
+    # 模型变体名称不受支持时抛出异常
+    raise ValueError(f"Unknown variant: {variant}")  
 
+# @at.typecheck 是一个类型检查装饰器，用于检查函数参数和返回值等是否符合声明的类型要求
 @at.typecheck
+# RMSNorm（Root Mean Square Layer Normalization，均方根归一化）
+# 是 Transformer 中的一种归一化层。
+# 它只根据特征的均方根进行缩放，不像 LayerNorm 那样减去均值。
 class RMSNorm(nn.Module):
+
+    # @nn.compact 允许在 __call__() 方法内部创建参数或子模块。
+    # 例如 self.param() 和 nn.Dense() 都可以在该方法中使用。
     @nn.compact
-    def __call__(self, x, cond):
+    # 执行 均方根归一化操作
+    def __call__(
+        self, 
+        # 输入 x：[batch_size, seq_len, width]
+        x, 
+        # 
+        cond
+    ):
         dtype = x.dtype  # original dtype, could be half-precision
         var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32
         normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32
