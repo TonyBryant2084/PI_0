@@ -11,7 +11,18 @@ def main():
     # 识别运行设备 (Devices: [CudaDevice(id=0)])
     print("Devices:", jax.devices())
 
-    # 2. 配置 Pi0 模型
+# 2. 配置 Pi0 模型
+    # config = Pi0Config(
+    #     action_dim=32,                        # 每个动作的维度为 32
+    #     action_horizon=50,                    # 每次预测连续 50 个动作
+    #     max_token_len=48,                     # 语言提示最多包含 48 个 token
+    #     dtype="bfloat16",                     # 模型计算使用 bfloat16 精度
+    #     paligemma_variant="gemma_2b",         # 使用 gemma_2b 配置的 PaliGemma 视觉语言模型
+    #     action_expert_variant="gemma_300m",   # 使用 gemma_300m 配置的 Action Expert 动作模型
+    #     pi05=False,                           # 不使用 Pi0.5 模型配置
+    #     discrete_state_input=False,           # 不将状态输入作为离散 token 处理
+    #     pytorch_compile_mode="max-autotune",  # 使用 PyTorch 编译的 max-autotune 模式，最大化自动调优
+    # )
     config = Pi0Config(
         dtype="bfloat16",
         paligemma_variant="gemma_2b",
@@ -21,7 +32,9 @@ def main():
     )
 
     # 3. 随机初始化模型，不加载预训练权重
+    #   1) 创建 JAX 随机数密钥，使用整数 0 作为随机种子，便于复现实验    
     rng = jax.random.PRNGKey(0)
+    #   2) 创建 PI0 模型
     model = config.create(rng)
 
     print("Model initialized.")

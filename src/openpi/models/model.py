@@ -258,12 +258,23 @@ class BaseModelConfig(abc.ABC):
         _, action_spec = self.inputs_spec(batch_size=batch_size)
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
 
-
+# @dataclasses.dataclass：
+#   1) Python 标准库提供的通用数据类装饰器，适用于普通 Python 程序
+#
+#   2) 自动生成 __init__() 等常用方法，简化类的定义
+#
+#   3) 类中声明的字段会被识别为 dataclass 字段，例如：
+#      dtype: str = "bfloat16"
+#      其中 dtype 是字段名，str 是类型标注，"bfloat16" 是默认值
+#
+#   4) 创建实例时，自动生成的 __init__() 会将传入的参数赋给实例属性
+#      如果没有传入对应参数，则使用字段声明中的默认值（前提是该字段有默认值）
+#
+#   5) 对于声明了默认值的字段，通常可以通过类名访问其默认值
+#      对于未声明默认值的字段，通常不能直接通过类名访问其值
+#      创建实例并赋值后，可以通过实例访问该属性
 @dataclasses.dataclass
 class BaseModel(nnx.Module, abc.ABC):
-    """Base class for all model implementations. Specific models should inherit from this class. They should call
-    super().__init__() to initialize the shared attributes (action_dim, action_horizon, and max_token_len).
-    """
 
     action_dim: int
     action_horizon: int
