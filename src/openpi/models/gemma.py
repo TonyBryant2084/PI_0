@@ -57,6 +57,7 @@ PALIGEMMA_VOCAB_SIZE = 257_152
 #      对于未声明默认值的字段，通常不能直接通过类名访问其值
 #      创建实例并赋值后，可以通过实例访问该属性
 @dataclasses.dataclass
+# 模型配置参数
 class Config:
 
     # Transformer 隐藏层的维度，即每个 Token 对应的特征向量维度
@@ -169,9 +170,9 @@ def get_config(variant: Variant) -> Config:
     # 模型变体名称不受支持时抛出异常
     raise ValueError(f"Unknown variant: {variant}")  
 
-# @at.typecheck 是一个类型检查装饰器，用于检查函数参数和返回值等是否符合声明的类型要求
+# @at.typecheck 是一个类型检查装饰器，用于检查函数调用是否符合声明的类型要求。
 @at.typecheck
-# RMSNorm（Root Mean Square Layer Normalization，均方根归一化）
+# RMSNorm（Root Mean Square Layer Normalization，方均根归一化）
 # 是 Transformer 中的一种归一化层。
 # 它只根据特征的均方根进行缩放，不像 LayerNorm 那样减去均值。
 class RMSNorm(nn.Module):
@@ -184,123 +185,471 @@ class RMSNorm(nn.Module):
         self, 
         # 输入 x：[batch_size, seq_len, width]
         x, 
-        # 
+        # 条件信息 cond：[batch_size, cond_dim]，用于生成 Adaptive RMSNorm 的 scale、shift 和 gate。
+        #
+        # 1. 如果 cond=None，则使用 Regular RMSNorm：
+        #    Regular RMSNorm(x) = x / sqrt(mean(x^2) + ε) ⊙ (1 + scale)
+        #    其中 scale 是 RMSNorm 自身的可学习参数，形状为 [width]。
+        #
+        # 2. 如果 cond != None，则使用 Adaptive RMSNorm：
+        #    Adaptive RMSNorm(x, cond) = x / sqrt(mean(x^2) + ε) ⊙ (1 + scale) + shift
+        #    其中 scale、shift 和 gate 由 cond 经过 Dense 层生成。
+        #
+        # 3. gate 不参与 RMSNorm 的归一化计算，而是在后续 Attention 残差连接中使用：
+        #    x_new = x + gate ⊙ Attention(Adaptive RMSNorm(x, cond))
+        #    gate 用于控制 Attention 输出对原始输入 x 的残差更新贡献。
+        #
+        # 4. 
+        #    1. *：逐元素相乘（Element-wise Multiplication），支持自动广播，参与运算的对象可以是标量、向量、矩阵或更高维张量，数学公式中通常用 ⊙ 表示逐元素相乘。
+        #    2. @：矩阵乘法（Matrix Multiplication），遵循矩阵乘法的维度匹配规则。
         cond
     ):
-        dtype = x.dtype  # original dtype, could be half-precision
-        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32
-        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32
-        if cond is None:
-            # regular RMSNorm
-            scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
-            normed_inputs = normed_inputs * (
-                1 + scale
-            )  # scale by learned parameter in float32 (matches Flax implementation)
-            return normed_inputs.astype(dtype), None  # return in original dtype
+        # 保存原始输入类型
+        dtype = x.dtype  
 
-        # adaptive RMSNorm
-        modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
+        # 计算每个 token 隐藏特征表示 的 平方均值
+        # 1. x.astype(jnp.float32)：先将输入转为 float32，提高平方和均值计算的数值精度。        
+        # 2. axis = -1：沿着最后一维（隐藏特征表示）进行求均值
+        # 3. keepdims = True：保留最后一个维度为 1
+        # var：[batch_size, seq_len, 1]
+        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  
+
+        # 计算 x / RMS = x / √(mean(x^2) + epsilon)
+        # epsilon = 1e-06：避免分母为 0
+        # normed_inputs：[batch_size, seq_len, width]
+        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))
+
+        # Regular RMSNorm：
+        if cond is None:
+            # 创建可学习参数 scale：[width]
+            scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
+
+            # Regular RMSNorm(x) = x / sqrt(mean(x^2) + ε) ⊙ (1 + scale)
+            #   1. normed_inputs = x / sqrt(mean(x^2) + ε)：[batch_size, seq_len, width]
+            #   2. (1 + scale)：[width]
+            #   3. 广播：从右向左对齐维度（维度数量不足时在左侧补 1），再将维度为 1 的维度扩展至匹配的大小
+            #           1. normed_inputs：[batch_size, seq_len, width]
+            #           2. (1 + scale)：[batch_size, seq_len, width]
+            #   4. 结果：[batch_size, seq_len, width]
+            normed_inputs = normed_inputs * (1 + scale)
+
+            # 以原始输入类型进行返回，因为是 Regular RMSNorm 所以没有 gate
+            # normed_inputs：[batch_size, seq_len, width]
+            return normed_inputs.astype(dtype), None 
+        
+        # Adaptive RMSNorm：
+        # 输入的条件信息 cond：[batch_size, cond_dim]
+        # cond -> Dense(全连接层) -> modulation
+        # modulation 是 scale, shift, gate 三组调制参数的集合：[batch_size, 3 * width]
+        modulation = nn.Dense(
+            # 输出特征维度：3 * width，用于生成 scale、shift、gate 三组参数。
+            features=x.shape[-1] * 3,
+
+            # 将全连接层的权重初始化为全 0。
+            kernel_init=nn.initializers.zeros,
+
+            # 指定全连接层的计算数据类型；输入和权重按该类型参与计算，
+            # 输出通常也是该类型。参数的存储类型由 param_dtype 控制。
+            dtype=dtype,
+        )(cond) 
+
+        # 将 modulation 拆分为 scale, shift, gate
+        # modulation[:, None, :]：[batch_size, 1, 3 * width]
+        # scale, shift, gate：[batch_size, 1, width]
         scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
-        normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
+
+        # normed_inputs：[batch_size, seq_len, width]
+        # (1 + scale)：[batch_size, 1, width] -> [batch_size, seq_len, width]
+        # shift：[batch_size, 1, width] -> [batch_size, seq_len, width]
+        # 结果：normed_inputs：[batch_size, seq_len, width]
+        normed_inputs = normed_inputs * (1 + scale) + shift  
+
+        # 以原始输入类型进行返回
+        # normed_inputs.astype(dtype)：[batch_size, seq_len, width]
+        # gate：[batch_size, 1, width]
         return normed_inputs.astype(dtype), gate
 
-
+# @at.typecheck 是一个类型检查装饰器，用于检查函数调用是否符合声明的类型要求。
 @at.typecheck
+# 词嵌入层
 class Embedder(nn.Module):
-    """Embedder module."""
 
+    # 词表大小：词表中的 token 的总数量
     vocab_size: int
+
+    # 词嵌入维度：每个 token 对应的特征向量的维度
     embed_dim: int
 
+    # 定义子模块
     def setup(self):
+
+        # 创建可学习的词嵌入表
+        # input_embedding_table：[vocab_size, embed_dim]
+        # 每个 token 对应 一个 embedding 向量
         self.input_embedding_table = self.param(
+            # 1. 参数名
             "input_embedding",
+            # 2. 初始化方式：使用正态分布初始化
             nn.initializers.normal(),
+            # 3. 参数形状：[vocab_size, embed_dim]
             (self.vocab_size, self.embed_dim),
         )
 
+    # 编码 token -> embedding 向量
     def encode(self, x):
+
+        # 使用 token ID 作为词嵌入表的行索引，取出对应的 embedding
+        # python：A[x] = A[(x,), B[x, y] = B[(x, y)]
+        # 输出：
+        #   1. x：单独的 token ID，则输出为：[embed_dim]
+        #   2. x：[seq_len]，即一堆 token ID，则输出为：[seq_len, embed_dim]
         x = self.input_embedding_table[(x,)]
+
+        # 将 embedding 向量乘以 sqrt(embed_dim)，调整其数值尺度。
+        # astype(dtype) 将缩放因子转换为输入 x 的数据类型。   
         x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
+
         return x
 
+    # 将 token 的 embedding 映射回 token
     def decode(self, x):
+
+        # x：[embed_dim]，在矩阵乘法中就当成 1 x embed_dim，而不是广播
+        # input_embedding_table.T：[embed_dim, vocab_size]
+        # x @ input_embedding_table.T：1 x vocab_size = [vacab_size]
         return jnp.dot(x, self.input_embedding_table.T)
 
+# 给每个 expert 的模块 起名字
+def _name(
+    # 1. 模块名称
+    name, 
+    # 2. expert 的索引
+    i
+):
+    # 如果 i==0 则直接返回原始名称
+    if i == 0:
+        return name
 
+    # 如果 i!=0，则在原始名称基础上添加下标
+    return f"{name}_{i}"
+
+# RoPE (Rotary Positional Embedding，旋转位置编码) 
+def _apply_rope(
+    # 1. 需要进行旋转的位置向量：[batch_size, seq_len, num_heads, head_dim]
+    x, 
+    # 2. *：前侧参数用关键字或者位置传参，后者只能通过关键字传参
+    *, 
+    # 3. 每个 token 的位置：[batch_size, seq_len]
+    positions, 
+    # 4. 最大波长
+    max_wavelength=10_000
+):
+    # 频率指数：
+    # freq_exponents：[head_dim / 2]
+    # 公式：freq_exponents[i] = 2i / head_dim, i = 0 ~ head_dim/2 - 1
+    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
+
+    # 时间尺度：处于相同位置的 token，时间尺度越大，旋转角度越小
+    # timescale：[head_dim / 2]
+    # 公式：timescale[i] = max_wavelength ** (2i / head_dim)
+    #
+    # 每个频率维度对应的 timescale 是固定的，与 token 的位置和具体内容无关，每个 token 有 head_dim/2 个频率维度
+    timescale = max_wavelength**freq_exponents
+
+    # 旋转角度：
+    # positions[..., None]：[batch_size, seq_len, 1]
+    # timescale[None, None, :]：[1, 1, head_dim / 2]
+    # positions[..., None] / timescale[None, None, :]：[batch_size, seq_len, head_dim / 2]
+    # radians：[batch_size, seq_len, head_dim / 2]
+    # b, l, i：第 b 个样本的第 l 个 token 的第 i 个频率维度
+    # 公式：radians[b, l, i] = position[b, l] / timescale[i]
+    #
+    # 每个 样本 的每个 token 都有一个固定的位置 positions[b, l]
+    # 每个 token 的每个频率维度对应的 timesacle[i] 是固定的，与 token 的位置和具体内容无关
+    # 通过 positions[b, l] 和 timescale[i] 即可算出每个 样本 的每个 token 的每个 频率维度 对应的 旋转角度
+    radians = positions[..., None] / timescale[None, None, :]
+
+    # radians：[batch_size, seq_len, 1, head_dim / 2]
+    radians = radians[..., None, :]
+
+    assert radians.dtype == jnp.float32
+
+    # 位置编码 与 头 无关
+    # sin, cos：[batch_size, seq_len, 1, head_dim / 2]
+    sin, cos = jnp.sin(radians), jnp.cos(radians)
+
+    # x1, x2：[batch_size, seq_len, num_heads, head_dim / 2]
+    x1, x2 = jnp.split(x, 2, axis=-1)
+
+    # res：[batch_size, seq_len, num_heads, head_dim]
+    res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+    assert res.dtype == jnp.float32
+
+    # res：[batch_size, seq_len, num_heads, head_dim]
+    return res.astype(x.dtype)
+
+
+# @at.typecheck 是一个类型检查装饰器，用于检查函数调用是否符合声明的类型要求。
 @at.typecheck
+# 注意力机制：将多个 Expert 的输入进行注意力计算
 class Attention(nn.Module):
-    """Attention module."""
 
+    # 模型的总配置参数序列（包括 lora 参数配置）
+    # Sequence：序列类型，指一组有顺序、可以通过索引访问的元素，他可以是 list, str, ...
     configs: Sequence[Config]
 
+    # Flax 提供的装饰器，允许在当前方法（通常是 __call__）中直接定义子模块
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
-        # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
+    # 执行函数
+    def __call__(
+        self,
+        # xs：输入
+        # xs 中的每个非空 x：[batch_size, seq_len, width]
+        xs, 
+        # 每个 token 的位置：[batch_size, seq_len]
+        positions, 
+        # 注意力掩码：[batch_size, 1, query_len, key_len]
+        attn_mask, 
+        # kv 缓存：
+        # kv_cache = (cache_k, cache_v)
+        # cache_k：[batch_size, seq_len_cache, num_kv_heads, head_dim]
+        # cache_v：[batch_size, seq_len_cache, num_kv_heads, head_dim]
+        kv_cache
+    ):
+
+        # 1. 确保每个 Expert 的 头的特征维度 相同
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
+        # 2. 确保每个 Expert 的 Query 头数 相同
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
+        # 3. 确保每个 Expert 的 Key, Value 头数 相同
         assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
 
-        dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
+        # 保存第一个非空输入的 type
+        dtype = next(x.dtype for x in xs if x is not None)
 
         qkvs = []
+
+        # 遍历每个 Expert 的 配置 以及 输入
+        # zip(xs, self.configs, strict=True)：把 xs 和 self.configs 中相同位置的元素配对，zip() 返回的是迭代器，不是严格意义上的列表
+        # strict=True：要求 zip() 中的所有序列长度相同；如果长度不同，就抛出 ValueError
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
+
+            # 若输入为空，则跳过本次循环，直接处理下一个 expert
             if x is None:
                 continue
+
+            # 若该 Expert 中 Query头的数量 = KeyValue头的数量
+            # QKV的权重可以放在一起进行线性变换 + LoRA 微调
             if config.num_kv_heads == config.num_heads:
+
+                # W_QKV 线性变换 + LoRA 微调
                 qkv_einsum = lora.Einsum(
+                    # W_QKV：[3, num_heads, width, head_dim]
+                    # W_Q = W_QKV[0], W_K = W_QKV[1], W_V = W_QKV[2]
                     shape=(3, config.num_heads, config.width, config.head_dim),
                     name=_name("qkv_einsum", i),
+                    # W_QKV 的初始化器
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
+                    # LoRA 配置参数
                     lora_config=config.lora_configs.get("attn"),
                 )
+
+                # x：[batch_size, seq_len, width]
+                # qkv_einsum("BSD,3KDH->3BSKH", x)：x 经过 W_QKV 线性变换 和 LoRA 微调后的结果
+                # qkv_einsum("BSD,3KDH->3BSKH", x)：[3, batch_size, seq_len, num_heads, head_dim]
                 qkvs.append(qkv_einsum("BSD,3KDH->3BSKH", x))
+
             else:
+
+                # W_Q 线性变换 + LoRA 微调
                 q_einsum = lora.Einsum(
+                    # W_Q：[num_heads, width, head_dim]
                     shape=(config.num_heads, config.width, config.head_dim),
                     name=_name("q_einsum", i),
+                    # W_Q 的初始化器
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+                    # LoRA 配置参数
                     lora_config=config.lora_configs.get("attn"),
                 )
+
+                # x：[batch_size, seq_len, width]
+                # q：x 经过 W_Q 线性变换 和 LoRA 微调后的结果
+                # q：[batch_size, seq_len, num_heads, head_dim]
                 q = q_einsum("BTD,NDH->BTNH", x)
+
+                # W_KV 线性变换 + LoRA 微调
                 kv_einsum = lora.Einsum(
+                    # W_KV：[2, num_kv_heads, width, head_dim]
+                    # W_K = W_KV[0], W_V = W_KV[1]
                     shape=(2, config.num_kv_heads, config.width, config.head_dim),
                     name=_name("kv_einsum", i),
+                    # W_KV 的初始化器
                     init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1)),
+                    # LoRA 配置参数
                     lora_config=config.lora_configs.get("attn"),
                 )
+
+                # x：[batch_size, seq_len, width]
+                # k, v：x 经过 W_Q 线性变换 和 LoRA 微调后的结果
+                # kv_einsum("BSD,2KDH->2BSKH", x)：[2, batch_size, seq_len, num_kv_heads, head_dim]
+                # k, v：[batch_size, seq_len, num_kv_heads, head_dim]
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
+
+                # (q, k, v) = (
+                #    q：[batch_size, seq_len, num_heads, head_dim],
+                #    k：[batch_size, seq_len, num_kv_heads, head_dim],
+                #    v：[batch_size, seq_len, num_kv_heads, head_dim]
+                #    且 num_heads != num_kv_heads
+                # )
                 qkvs.append((q, k, v))
 
+        # 所有 expert 的 num_heads 和 num_kv_heads 配置一致，因此它们要么全部使用合并的 QKV 张量，要么全部分别保存 Q、K、V 张量
+
+        # 方式一：所有 expert 都使用合并的 QKV 张量
+        #
+        # qkvs = [
+        #     qkv1：[3, batch_size, seq_len_1, num_heads, head_dim]
+        #     qkv2：[3, batch_size, seq_len_2, num_heads, head_dim]
+        #     qkv3：[3, batch_size, seq_len_3, num_heads, head_dim]
+        # ]
+        #
+        # zip(*qkvs) 按照第一个维度进行配对，得到：
+        # (
+        #     (qkv1[0], qkv2[0], qkv3[0]),  # 所有 expert 的 Q
+        #     (qkv1[1], qkv2[1], qkv3[1]),  # 所有 expert 的 K
+        #     (qkv1[2], qkv2[2], qkv3[2]),  # 所有 expert 的 V
+        # )
+        #
+        # 其中：
+        # qkv1[0].shape = [batch_size, seq_len_1, num_heads, head_dim]
+        # qkv2[0].shape = [batch_size, seq_len_2, num_heads, head_dim]
+        # qkv3[0].shape = [batch_size, seq_len_3, num_heads, head_dim]
+        #
+        # qkv1[1].shape = [batch_size, seq_len_1, num_heads, head_dim]
+        # qkv2[1].shape = [batch_size, seq_len_2, num_heads, head_dim]
+        # qkv3[1].shape = [batch_size, seq_len_3, num_heads, head_dim]
+        #
+        # qkv1[2].shape = [batch_size, seq_len_1, num_heads, head_dim]
+        # qkv2[2].shape = [batch_size, seq_len_2, num_heads, head_dim]
+        # qkv3[2].shape = [batch_size, seq_len_3, num_heads, head_dim]
+
+
+        # 方式二：所有 expert 都使用 (q, k, v) 元组
+        #
+        # qkvs = [
+        #     (q1, k1, v1),
+        #     (q2, k2, v2),
+        #     (q3, k3, v3),
+        # ]
+        #
+        # zip(*qkvs) 按照元组中的位置进行配对，得到：
+        # (
+        #     (q1, q2, q3),  # 所有 expert 的 Q
+        #     (k1, k2, k3),  # 所有 expert 的 K
+        #     (v1, v2, v3),  # 所有 expert 的 V
+        # )
+        #
+        # Q 的 shape：
+        # q1.shape = [batch_size, seq_len_1, num_heads, head_dim]
+        # q2.shape = [batch_size, seq_len_2, num_heads, head_dim]
+        # q3.shape = [batch_size, seq_len_3, num_heads, head_dim]
+        #
+        # K 的 shape：
+        # k1.shape = [batch_size, seq_len_1, num_kv_heads, head_dim]
+        # k2.shape = [batch_size, seq_len_2, num_kv_heads, head_dim]
+        # k3.shape = [batch_size, seq_len_3, num_kv_heads, head_dim]
+        #
+        # V 的 shape：
+        # v1.shape = [batch_size, seq_len_1, num_kv_heads, head_dim]
+        # v2.shape = [batch_size, seq_len_2, num_kv_heads, head_dim]
+        # v3.shape = [batch_size, seq_len_3, num_kv_heads, head_dim]
+
+        # q：[batch_size, seq_len_sum, num_heads, head_dim]
+        # k：[batch_size, seq_len_sum, num_kv_heads, head_dim]
+        # v：[batch_size, seq_len_sum, num_kv_heads, head_dim]
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
+        # 对 Query（查询向量）应用旋转位置编码 RoPE
+        # q：[batch_size, seq_len_sum, num_heads, head_dim]
         q = _apply_rope(q, positions=positions)
+
+        # 在计算注意力分数之前缩放 Query，使点积结果不至于随着 head_dim 增大而过大
+        # q = q / √head_dim
         q *= self.configs[0].head_dim ** -0.5
 
+        # 对 Query（查询向量）应用旋转位置编码 RoPE
+        # k：[batch_size, seq_len_sum, num_kv_heads, head_dim]
         k = _apply_rope(k, positions=positions)
 
-        # should still be half-precision here (if input was half-precision)
+        # 确保 q, k, v 和 x 的数据类型相同
         assert q.dtype == k.dtype == v.dtype == dtype
 
+        # 若 KV_Cache 不为空，则将 k_cache 和 v_cache 分别于 k, v 拼接
         if kv_cache is not None:
+
+            # kv_cache = (cache_k, cache_v)
+            # cache_k, cache_v：[batch_size, seq_len_cache, num_kv_heads, head_dim]
             cache_k, cache_v = kv_cache
+
+            # k, v：[batch_size, seq_len_cache+sum, num_kv_heads, head_dim]
             k = jnp.concatenate([cache_k, k], axis=1)
             v = jnp.concatenate([cache_v, v], axis=1)
 
+        # 三种注意力机制：
+        # 1. MHA（Multi-Head Attention，多头注意力）：Q、K、V 的 Head 数量通常相同，每个 Q Head 对应一个 KV Head
+        # 2. GQA（Grouped-Query Attention，分组查询注意力）：Q Head 数量大于 KV Head 数量，每组 多个 Q Head 共享一个 KV Head，每组 Q Head 数量为 num_heads / num_kv_heads
+        # 3. MQA（Multi-Query Attention，多查询注意力）：所有 Q Head 共享同一个 KV Head，即 K 和 V 各只有一个 Head
+        # pi0 使用的是 GQA
+
+        # einops.rearrange() 的作用是按照指定的形状规则重新组织张量的维度，例如拆分维度、合并维度、调整维度顺序
+        # (K G) -> K, G：将多个 Q Head 进行分组，每组有多个 Q Head 共享一个 KV Head 
+        # K=self.configs[0].num_kv_heads：指定 KV Head 的大小，einops 会根据大小自动推断 G 的值
+        # q：[(B)batch_size, (T)seq_len_sum, (K G)num_heads, (H)head_dim] ->
+        #    [(B)batch_size, (T)seq_len_sum, (K)num_kv_heads, (G)num_q_heads_per_kv_heads, (H)head_dim]
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
+
+        # 计算注意力分数：
+        # q：[(B)batch_size, (T)seq_len_sum, (K)num_kv_heads, (G)num_q_heads_per_kv_heads, (H)head_dim]
+        # k：[(B)batch_size, (S)seq_len_cache+sum, (K)num_kv_heads, (H)head_dim]
+        # preferred_element_type=jnp.float32：指定 einsum 运算结果优先采用 float32 数据类型，具体的内部计算与累加精度由 JAX 后端决定
+        # logits：[(B)batch_size, (K)num_kv_heads, (G)num_q_heads_per_kv_heads, (T)seq_len_sum, (S)seq_len_cache+sum]
         logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
 
+        # 检查注意力掩码 attn_mask 的形状是否符合要求，如果不符合则抛出错误
+        # 要求 attn_mask：[batch_size, 1, seq_len_sum, seq_len_cache+sum]，是 token 之间的关系，与具体是哪个头无关
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
-                f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
+                f"注意力掩码实际的 shape：{attn_mask.shape}"
+                f"要求的 shape：{(q.shape[0], 1, q.shape[1], k.shape[1])}"
             )
 
+        # logits 数据类型能表示的有限最小值（代表屏蔽）
         # big_neg = jnp.finfo(logits.dtype).min
         big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
+        # 掩码后的注意力分数
+        # 将注意力掩码 attn_mask 为 False 处的注意力分数 logits 替换为 big_neg
+        # attn_mask[:, :, None, :, :]：[batch_size, 1, 1, seq_len_sum, seq_len_cache+sum]
+        #
+        # jnp.where(condition, x, y) 要求三个参数的 shape 能够广播到兼容的形状：
+        # 所以 condition, x, y 都会广播成：[(B)batch_size, (K)num_kv_heads, (G)num_q_heads_per_kv_heads, (T)seq_len_sum, (S)seq_len_cache+sum] 
+        masked_logits = jnp.where(
+            # 决定每个位置选择哪个值
+            attn_mask[:, :, None, :, :], 
+            # 条件为 True 时选择的值
+            logits, 
+            # 条件为 False 时选择的值
+            big_neg
+        )
+
+        # 通过 softmax 层将 掩码后的注意力分数 变成 注意力权重
+        # probs：[(B)batch_size, (K)num_kv_heads, (G)num_q_heads_per_kv_heads, (T)seq_len_sum, (S)seq_len_cache+sum]
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
 
+        # 注意力输出（将 注意力权重 施加在 Value 上的结果）
+        # probs：[(B)batch_size, (K)num_kv_heads, (G)num_q_heads_per_kv_heads, (T)seq_len_sum, (S)seq_len_cache+sum]
+        # v：
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -493,36 +842,6 @@ class Module(nn.Module):
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
         )
-
-
-def _apply_rope(x, *, positions, max_wavelength=10_000):
-    """Applies RoPE positions [B, L] to x [B, L, H, D]."""
-    freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
-    timescale = max_wavelength**freq_exponents
-    radians = positions[..., None] / timescale[None, None, :]
-    radians = radians[..., None, :]
-    assert radians.dtype == jnp.float32
-    # radians.shape = [...,L,1,d=D/2]
-    sin, cos = jnp.sin(radians), jnp.cos(radians)
-    x1, x2 = jnp.split(x, 2, axis=-1)
-    res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-    assert res.dtype == jnp.float32
-    # The original bigvision impl allows RoPE to upcast to float32. It is then immediately downcast again to the cache
-    # dtype when in inference mode (but not in training mode). I don't think any of this was intentional. Based on the
-    # original DeepMind impl, as well as the widely-used transformers impl, it is ok to always downcast back to bfloat16
-    # here.
-    return res.astype(x.dtype)
-
-
-def _name(name, i):
-    # we name layers like this because we want the first expert's weights to have no suffix (e.g., "attn"), so that they
-    # can be loaded seamlessly from the existing PaliGemma checkpoint. subsequent experts will have a suffix (e.g.,
-    # "attn_1") and their weights will be initialized from scratch. in practice, we only use two experts -- PaliGemma,
-    # and the action expert.
-    if i == 0:
-        return name
-    return f"{name}_{i}"
-
 
 def _gated_residual(x, y, gate):
     assert (x is None) == (y is None)
