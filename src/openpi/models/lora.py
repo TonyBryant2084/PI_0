@@ -244,7 +244,7 @@ class FeedForward(nn.Module):
         # x：[batch_size, seq_len, features]
         dtype = x.dtype
 
-        # ff_gate：门控分支输出，经过 GELU 激活后用于调节特征分支的输出
+        # ff_gate：门控分支输出的中间结果
         # ff_gate：x @ W_Gate | x @ W_Gate + x @ W_Gate_LoRA_a @ W_Gate_LoRA_b
         # ff_gate：[batch_size, seq_len, hidden_dim]
         ff_gate = self._dot(
