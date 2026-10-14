@@ -998,10 +998,10 @@ class Module(nn.Module):
 
     # 模型的总配置参数序列（包括 lora 参数配置）
     # Sequence：序列类型，指一组有顺序、可以通过索引访问的元素，他可以是 list, str, ...
-    configs: Sequence[Config]
+    configs: Sequence[Config] # [Config("gemma_2b"), Config("gemma_300m")]
 
-    # Expert 输入的 Embedding 的数据类型
-    embed_dtype: str
+    # 词嵌入结果的指定类型
+    embed_dtype: str # "bfloat16"
 
     # dropout：每个独立判断位置被丢弃的概率
     dropout: float = 0.0

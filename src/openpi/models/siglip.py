@@ -185,27 +185,92 @@ class MAPHead(nn.Module):
         return x[:, 0]
 
 
+# Vision Transformer 模型
 class _Module(nn.Module):
-    """ViT model."""
 
+    # num_classes：分类类别数量
+    # 1. int：输出类别数量，例如 1000
+    # 2. None：不创建最终的分类 Head，保留特征表示
     num_classes: int | None = None
+
+    # patch_size：每个图像 Patch（图像块）的大小
+    # 1. Sequence[int]：包含 Patch 高度和宽度的序列
+    # 2. 默认 (16, 16)，表示每个 Patch 的大小为 16×16 像素
     patch_size: Sequence[int] = (16, 16)
+
+    # width：Transformer 的隐藏特征维度，也是 Patch Embedding 的输出通道数量
+    # 例如 width=768，则每个 Patch Token 对应 768 维特征
     width: int = 768
+
+    # depth：Transformer Encoder 中的 Block 数量
+    # 例如 depth=12，表示包含 12 层 Transformer Block
     depth: int = 12
-    mlp_dim: int | None = None  # Defaults to 4x input dim
+
+    # mlp_dim：Transformer Block 中 FeedForward / MLP 的中间隐藏维度
+    # None：由 Encoder 内部决定默认值，通常为 width 的 4 倍，例如 width=768，则常见的 mlp_dim=3072
+    mlp_dim: int | None = None
+
+    # num_heads：Multi-Head Attention（多头注意力）的 Head 数量
+    # 例如 num_heads=12，当 width=768 且平均划分时，每个 Head 的维度为 768/12=64
     num_heads: int = 12
-    posemb: str = "learn"  # Can also be "sincos2d"
+
+    # posemb：Position Embedding（位置嵌入）的类型
+    # 1. "learn"：使用可学习的位置嵌入
+    # 2. "sincos2d"：使用二维正弦余弦位置编码
+    posemb: str = "learn"
+
+    # rep_size：Representation Size（表示层输出维度）
+    # 1. int：创建指定输出维度的表示层，例如 rep_size=512，则表示层输出维度为 512
+    # 2. bool：
+    #   1) True：创建输出维度为 width 的表示层
+    #   2) False：不创建额外的表示层
     rep_size: int | bool = False
+
+    # dropout：Dropout Rate（随机丢弃概率）
+    # 1. 0.0：不进行随机丢弃
+    # 2. 0.1：训练时以 10% 的概率丢弃部分特征
     dropout: float = 0.0
-    pool_type: str = "gap"  # Can also be "map" or "tok"
+
+    # pool_type：Pooling Type（特征池化方式）
+    # 1. "gap"：Global Average Pooling，对所有 Token 取平均
+    # 2. "map"：Multihead Attention Pooling，使用注意力池化
+    # 3. "tok"：使用额外添加的 CLS Token 进行池化
+    # 4. "0"：直接使用第一个 Token 的隐藏特征
+    # 5. "none"：不执行池化，保留所有 Token
+    pool_type: str = "gap"
+
+    # head_zeroinit：是否将分类 Head 的权重初始化为全零
+    # 1. True：分类 Head 的 kernel 使用全零初始化
+    # 2. False：使用 nn.Dense 默认的 kernel 初始化方式
     head_zeroinit: bool = True
+
+    # scan：是否在 Encoder 内部使用 nn.scan() 组织 Transformer Block
+    # 1. True：使用 scan 形式
+    # 2. False：使用非 scan 形式
+    # 具体实现由 Encoder 决定
     scan: bool = False
-    # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
+
+    # remat_policy：Gradient Checkpointing（梯度检查点）的重计算策略
+    # 1. "nothing_saveable"：不保存被策略控制的中间结果，反向传播时重新计算
+    # 2. "dots_with_no_batch_dims_saveable"：允许保存部分 dot 运算结果，通常用更多显存换取更少的重计算
     remat_policy: str = "nothing_saveable"
+
+    # dtype_mm：Matrix Multiplication Data Type（矩阵乘法计算数据类型）
+    # "float32"：使用 32 位浮点数
+    # 也可以配置为 "bfloat16" 等较低精度类型
+    # 注意：不代表所有模型参数都使用该数据类型
     dtype_mm: str = "float32"
 
+    # @nn.compact 允许在 __call__() 方法内部创建参数或子模块。
+    # 例如 self.param() 和 nn.Dense() 都可以在该方法中使用。
     @nn.compact
-    def __call__(self, image, *, train=False):
+    def __call__(
+        self, 
+        # 图像输入：[batch_size, image_height, image_width, image_channels]
+        image, 
+        *, 
+        train=False
+    ):
         out = {}
 
         # Kevin edit: do patch extraction and posemb in float32,

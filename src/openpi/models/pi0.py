@@ -69,34 +69,83 @@ class Pi0(_model.BaseModel):
         self, 
         # PI0 配置参数
         config: pi0_config.Pi0Config, 
-        # 根据 JAX 的随机数密钥 rng，创建一个用于管理随机数密钥的对象 rngs，供后续模型初始化等操作使用
+        # 根据 JAX 的随机数密钥 rng，创建的用于管理随机数密钥的对象 rngs（nnx.Rngs），供后续模型初始化等操作使用
         rngs: nnx.Rngs
     ):
 
         # 调用父类的初始化函数
         super().__init__(
-            config.action_dim,      # 动作维度：一个动作需要多少个部分共同完成
-            config.action_horizon,  # 动作序列长度：一次预测产生的动作数量
-            config.max_token_len    # 最大 token 数：语言提示可最多包含的 token 数
+            # 动作维度：一个动作需要多少个部分共同完成
+            config.action_dim, # 32
+            # 动作序列长度：一次预测产生的动作数量
+            config.action_horizon, # 50
+            # 最大 token 数：语言提示可最多包含的 token 数
+            config.max_token_len # 48
         )
 
-        # 是否启用 PI05 模型（Bool)
-        self.pi05 = config.pi05
+        #  是否启用 PI05 模型（Bool)
+        self.pi05 = config.pi05 # False
 
         # 根据 Pi0Config 中指定的模型配置名称，获取 PaliGemma 主干模型的配置
+        # config.paligemma_variant == "gemma_2b"
+        # paligemma_config == Config(
+        #     width=2048,      # 隐藏层维度
+        #     depth=18,        # Transformer 层数
+        #     mlp_dim=16_384,  # MLP 中间层维度
+        #     num_heads=8,     # Query（查询向量）的注意力头数量
+        #     num_kv_heads=1,  # Key（键向量）和 Value（值向量）的注意力头数量
+        #     head_dim=256,    # 每个注意力头的特征维度
+        # )
         paligemma_config = _gemma.get_config(config.paligemma_variant)
 
         # 根据 Pi0Config 中指定的模型配置名称，获取 Action Expert 动作专家的配置
+        # config.action_expert_variant == "gemma_300m"
+        # action_expert_config == Config(
+        #     width=1024,      # 隐藏层维度
+        #     depth=18,        # Transformer 层数
+        #     mlp_dim=4096,    # MLP 中间层维度
+        #     num_heads=8,     # Query（查询向量）的注意力头数量
+        #     num_kv_heads=1,  # Key（键向量）和 Value（值向量）的注意力头数量
+        #     head_dim=256,    # 每个注意力头的特征维度
+        # )
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
+        # 创建 π0 的 Gemma Transformer 模型，并将其包装为 Flax NNX 兼容模块。
+        # 其中包含两个 Expert：
+        #   1. Expert 0：PaliGemma（VLM），负责处理视觉、语言等多模态特征。
+        #   2. Expert 1：Action Expert（动作专家），负责处理机器人状态和带噪动作等特征。
+        # 两个 Expert 使用各自的模型参数，通过联合 Attention 实现信息交互。
+        # 
+        # ToNNX 是 OpenPI 使用的兼容桥接工具，用于将 Flax Linen 模块包装为可以通过 Flax NNX 风格接口使用的模块
         llm = nnx_bridge.ToNNX(
+            # _gemma.Module：基于 Flax Linen 实现的多 Expert Transformer 模型
             _gemma.Module(
-                configs=[paligemma_config, action_expert_config],
-                embed_dtype=config.dtype,
-                adarms=config.pi05,
+                # 各 Expert 的 配置实例
+                configs=[
+                    # VLM 的 Config 配置实例
+                    paligemma_config, 
+                    # Action Expert 的 Config 配置实例
+                    action_expert_config
+                ],
+                # 词嵌入结果的指定类型
+                embed_dtype=config.dtype, # "bfloat16"
+                adarms=config.pi05, # False
             )
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+
+        # lazy_init()：通过虚拟输入执行模型的参数初始化，不进行实际训练
+        llm.lazy_init(
+            # 用于管理随机数密钥的对象 rngs（nnx.Rngs），用于初始化模型参数
+            # lazy_init() 所需要的参数
+            rngs=rngs, 
+            # 指定调用 _gemma.Module 中自定义的 init() 方法
+            # lazy_init() 所需要的参数
+            method="init", 
+            # VLM 和 Action Expert 是否启用 Adaptive RMSNorm（
+            # _gemma.Module.init() 所需要的参数，由 lazy_init() 转发给 Module.init() 函数
+            use_adarms=[False, True] if config.pi05 else [False, False] # [False, False]
+        )
+
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -106,6 +155,7 @@ class Pi0(_model.BaseModel):
                 dtype_mm=config.dtype,
             )
         )
+
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)

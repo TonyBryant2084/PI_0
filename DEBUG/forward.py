@@ -13,14 +13,14 @@ def main():
 
 # 2. 配置 Pi0 模型
     # config = Pi0Config(
+    #     dtype="bfloat16",                     # 词嵌入结果的指定类型，模型计算使用 bfloat16 精度
+    #     paligemma_variant="gemma_2b",         # 使用 gemma_2b 配置的 PaliGemma 视觉语言模型
+    #     action_expert_variant="gemma_300m",   # 使用 gemma_300m 配置的 Action Expert 动作模型
     #     action_dim=32,                        # 每个动作的维度为 32
     #     action_horizon=50,                    # 每次预测连续 50 个动作
     #     max_token_len=48,                     # 语言提示最多包含 48 个 token
-    #     dtype="bfloat16",                     # 模型计算使用 bfloat16 精度
-    #     paligemma_variant="gemma_2b",         # 使用 gemma_2b 配置的 PaliGemma 视觉语言模型
-    #     action_expert_variant="gemma_300m",   # 使用 gemma_300m 配置的 Action Expert 动作模型
-    #     pi05=False,                           # 不使用 Pi0.5 模型配置
     #     discrete_state_input=False,           # 不将状态输入作为离散 token 处理
+    #     pi05=False,                           # 不使用 Pi0.5 模型配置
     #     pytorch_compile_mode="max-autotune",  # 使用 PyTorch 编译的 max-autotune 模式，最大化自动调优
     # )
     config = Pi0Config(
