@@ -23,28 +23,94 @@ import numpy as np
 
 import openpi.training.sharding as sharding
 
-
-def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
-    """Follows the MoCo v3 logic."""
+# 生成二维正弦余弦位置编码（2D Sinusoidal Positional Embedding）
+def posemb_sincos_2d(
+    # patch_rows：patch 的行数
+    h, 
+    # patch_cols：patch 的列数
+    w, 
+    # 每个 patch token 的特征维度：features
+    width, 
+    # 频率缩放基数
+    temperature=10_000.0, 
+    # 位置编码的数据类型
+    dtype=jnp.float32
+):
+    # h = patch_rows：Patch 的行数
+    # w = patch_cols：Patch 的列数
+    #
+    # jnp.mgrid[:h, :w]：生成每个 Patch 的行坐标和列坐标
+    #
+    # 例如：h = 2，w = 3
+    # jnp.mgrid[:2, :3]：
+    #   :2 = [0, 1]     # 行坐标范围
+    #   :3 = [0, 1, 2]  # 列坐标范围
+    #
+    # 对应的 Patch 坐标：
+    # (0, 0) (0, 1) (0, 2)
+    # (1, 0) (1, 1) (1, 2)
+    #
+    # y：记录每个 Patch 的行坐标
+    # y = [[0, 0, 0],
+    #      [1, 1, 1]]
+    #
+    # x：记录每个 Patch 的列坐标
+    # x = [[0, 1, 2],
+    #      [0, 1, 2]]
+    #
+    # jnp.mgrid[:h, :w].shape = (2, patch_rows, patch_cols)
+    # y.shape = x.shape = (patch_rows, patch_cols)
+    #
+    # 例如：y.shape = x.shape = (2, 3)
     y, x = jnp.mgrid[:h, :w]
 
+    # width 要是 4 的倍数
     assert width % 4 == 0, "Width must be mult of 4 for sincos posemb"
+    
+    # omega：不同特征维度对应的角频率（Angular Frequency）
+    # omega = [0, 1/(width/4-1), ..., (width/4-2)/(width/4-1), 1]
+    # omega = [width/4]
     omega = jnp.arange(width // 4) / (width // 4 - 1)
+    # omega = [1/(10000^(0)), ..., 1/(10000^1)]
     omega = 1.0 / (temperature**omega)
+
+
     y = jnp.einsum("m,d->md", y.flatten(), omega)
     x = jnp.einsum("m,d->md", x.flatten(), omega)
     pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
     return jnp.asarray(pe, dtype)[None, :, :]
 
-
-def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
+# 获取位置编码：Get Positinal Embedding
+def get_posemb(
+    self, 
+    # 位置编码类型：
+    # 1. "learn"：可学习位置编码（Learnable Positional Embedding）
+    # 2. "sincos2d"：二维正弦余弦位置编码（2D Sinusoidal Positional Embedding）
+    typ, 
+    # patch 排列方式：[patch_rows, patch_cols]
+    seqshape, 
+    # 每个 patch token 的特征维度：features
+    width, 
+    # 可学习位置编码参数的名称
+    name, 
+    # 位置编码的数据类型
+    dtype=jnp.float32
+):
+    # 1. "learn"：可学习位置编码（Learnable Positional Embedding）
     if typ == "learn":
         return self.param(
+            # 1. 参数名称
             name,
+            # 2. 初始化器
+            # stddev（standard deviation 标准差）= 1 / √features
             nn.initializers.normal(stddev=1 / np.sqrt(width)),
+            # 3. shape：[1, patch_rows * patch_cols, width]
+            # prod（product）：乘积
             (1, np.prod(seqshape), width),
+            # 4. 位置编码的数据类型
             dtype,
         )
+    # 2. "sincos2d"：二维正弦余弦位置编码（2D Sinusoidal Positional Embedding）
     if typ == "sincos2d":
         return posemb_sincos_2d(*seqshape, width, dtype=dtype)
     raise ValueError(f"Unknown posemb type: {typ}")
@@ -261,33 +327,57 @@ class _Module(nn.Module):
     # 注意：不代表所有模型参数都使用该数据类型
     dtype_mm: str = "float32"
 
-    # @nn.compact 允许在 __call__() 方法内部创建参数或子模块。
-    # 例如 self.param() 和 nn.Dense() 都可以在该方法中使用。
+    # @nn.compact 允许在 __call__() 方法内部创建参数或子模块
+    # 例如 self.param() 和 nn.Dense() 都可以在该方法中使用
     @nn.compact
     def __call__(
         self, 
-        # 图像输入：[batch_size, image_height, image_width, image_channels]
+        # 图像输入：[batch_size, height, width, channels]
         image, 
         *, 
+        # train：是否处于训练模式
+        # True：训练模式，允许执行 Dropout
+        # False：推理模式，关闭 Dropout
         train=False
     ):
         out = {}
 
-        # Kevin edit: do patch extraction and posemb in float32,
-        # because I feel like it's a bit safer.
+        # 将 image 转成 float32 格式
         image = jnp.asarray(image, jnp.float32)
 
-        # Patch extraction
+        # kernal：[patch_height, patch_width, channels, features]
+        # x：[batch_size, patch_rows, patch_cols, features]
+        #
+        # batch_size：图像个数
+        # patch_height：单个 Patch 的高度
+        # patch_width：单个 Patch 的宽度
+        # patch_rows：Patch 的行数
+        # patch_cols：Patch 的列数
+        # channels：输入图像的通道数
+        # features：每个 Patch 输出的特征维度
+        #
+        # out["stem"] = nn.Conv(...)(image)：将结果存入 out dict，key 为 "stem"
         x = out["stem"] = nn.Conv(
-            self.width,
-            self.patch_size,
+            # 卷积核个数
+            features = self.width,
+            # 卷积核的大小
+            kernel_size = self.patch_size,
+            # 步长
             strides=self.patch_size,
-            padding="VALID",
+            # 不进行边界填充
+            padding="VALID", 
+            # 卷积子模块名称
             name="embedding",
+            # 卷积计算使用的数据类型
             dtype=jnp.float32,
         )(image)
 
+        # n = batch_size
+        # h = patch_rows
+        # w = patch_cols
+        # c = features
         n, h, w, c = x.shape
+        # x：[batch_size, patch_rows * patch_cols, features]
         x = jnp.reshape(x, [n, h * w, c])
 
         # Add posemb before adding extra token.
