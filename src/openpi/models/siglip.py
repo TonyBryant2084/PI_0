@@ -908,43 +908,33 @@ class Encoder(nn.Module):
             # ...
             # out["block11"]：第 12 层的中间结果
 
-            # range(self.depth) = 
-            # lyr：layer_index
+            # range(self.depth)：返回一个可迭代的 range 实例，0 ~ self.depth-1
+            # lyr：layer_index 表示每一层的下标
             for lyr in range(self.depth):
 
-                # lyr：当前层索引（Layer Index）
-                # range(12) → 0, 1, 2, ..., 11
+                # jax.tree.map() 是 JAX 提供的 PyTree 映射函数，它会遍历 PyTree 中的所有叶子节点，对每个叶子节点执行 f，不会修改原来的 PyTree，而是返回一个新的 PyTree，新 PyTree 保留原来的容器结构，但叶子节点的值可以改变
+                # 基本语法：
+                #   jax.tree.map(
+                #       f,       # 对每个叶子节点执行的函数
+                #       tree,    # 需要遍历的 PyTree
+                #   )
                 #
-                # f"block{lyr:02d}"：
-                #   f-string：格式化字符串
-                #   02d：将整数格式化为至少 2 位，不足补 0
-                #
-                # 例如：
-                # lyr=0  → "block00"
-                # lyr=1  → "block01"
-                # lyr=11 → "block11"
-                #
-                # jax.tree.map：对 PyTree 中的每个叶子节点执行函数
-                # PyTree：JAX 的嵌套数据结构，例如 dict、list、tuple
-                #
-                # 这里对 scan_out 中的每个张量取第 lyr 层
+                # jax.tree.map
                 out[f"block{lyr:02d}"] = jax.tree.map(
-                    # lambda：匿名函数（Anonymous Function）
-                    #
-                    # o：scan_out 中的某个叶子张量
-                    # 例如：[depth, batch_size, seq_len, features]
-                    #
-                    # lyr=lyr：将当前循环层索引绑定为默认参数
-                    # o[lyr]：提取该张量的第 lyr 层
-                    #
-                    # 例如：
-                    # o.shape=[12, 2, 197, 768]
-                    # lyr=3
-                    # o[3].shape=[2, 197, 768]
+
+                    # 对每个叶子节点执行的函数
+                    # 此时的 o 就是 scan_out 中每一组键值对的值
+                    # o：[depth, batch_size, seq_len, features]
+                    # 由于新 PyTree 会保留原来的容器结构，所以键会自动保留
                     lambda o, lyr=lyr: o[lyr],
 
-                    # tree：需要遍历的 PyTree
-                    # scan_out：所有 Encoder Block 的中间结果
+                    # 需要遍历的 PyTree
+                    # scan_out = {
+                    #     "sa":   [depth, batch_size, seq_len, features],
+                    #     "+sa":  [depth, batch_size, seq_len, features],
+                    #     "mlp":  [depth, batch_size, seq_len, features],
+                    #     "+mlp": [depth, batch_size, seq_len, features],
+                    # } 
                     scan_out,
                 )
 
