@@ -62,22 +62,46 @@ def posemb_sincos_2d(
     # y.shape = x.shape = (patch_rows, patch_cols)
     #
     # 例如：y.shape = x.shape = (2, 3)
+    #
+    # y, x：[patch_rows, patch_cols]
     y, x = jnp.mgrid[:h, :w]
 
     # width 要是 4 的倍数
     assert width % 4 == 0, "Width must be mult of 4 for sincos posemb"
     
     # omega：不同特征维度对应的角频率（Angular Frequency）
-    # omega = [0, 1/(width/4-1), ..., (width/4-2)/(width/4-1), 1]
-    # omega = [width/4]
+    # omega = [0, 1/(width//4-1), ..., (width//4-2)/(width//4-1), 1]
+    # omega = [width//4]
     omega = jnp.arange(width // 4) / (width // 4 - 1)
     # omega = [1/(10000^(0)), ..., 1/(10000^1)]
     omega = 1.0 / (temperature**omega)
 
-
+    # y：[patch_rows, patch_cols]
+    # y.flatten()：[patch_rows * patch_cols]
+    # omega：[width // 4]
+    #
+    # "m,d->md"：向量外积（Outer Product）
+    #   将 y.flatten() 中的每个元素分别与 omega 中的所有元素相乘。
+    #   m：Patch 索引，共 patch_rows * patch_cols 个
+    #   d：角频率索引，共 width // 4 个
+    #
+    # 计算公式：
+    #   output[m, d] = y.flatten()[m] * omega[d]
+    #
+    # 结果 y：[patch_rows * patch_cols, width // 4]
     y = jnp.einsum("m,d->md", y.flatten(), omega)
+    
+    # 结果 x：[patch_rows * patch_cols, width // 4]
     x = jnp.einsum("m,d->md", x.flatten(), omega)
+
+    # jnp.sin(x)：[patch_rows * patch_cols, width // 4]
+    # jnp.cos(x)：[patch_rows * patch_cols, width // 4]
+    # jnp.sin(y)：[patch_rows * patch_cols, width // 4]
+    # jnp.cos(y)：[patch_rows * patch_cols, width // 4]
+    # pe：[patch_rows * patch_cols, width]
     pe = jnp.concatenate([jnp.sin(x), jnp.cos(x), jnp.sin(y), jnp.cos(y)], axis=1)
+
+    # pe：[1, patch_rows * patch_cols, width]
     return jnp.asarray(pe, dtype)[None, :, :]
 
 # 获取位置编码：Get Positinal Embedding
@@ -112,119 +136,890 @@ def get_posemb(
         )
     # 2. "sincos2d"：二维正弦余弦位置编码（2D Sinusoidal Positional Embedding）
     if typ == "sincos2d":
+        # posemb_sincos_2d：[1, patch_rows * patch_cols, width]
         return posemb_sincos_2d(*seqshape, width, dtype=dtype)
+
     raise ValueError(f"Unknown posemb type: {typ}")
 
 
 class MlpBlock(nn.Module):
-    """Transformer MLP / feed-forward block."""
+    """Transformer MLP / Feed-Forward Block（多层感知机 / 前馈网络）"""
 
-    mlp_dim: int | None = None  # Defaults to 4x input dim
+    # mlp_dim：MLP 中间隐藏层的特征维度
+    # None：默认使用输入特征维度 features 的 4 倍
+    # 例如：features=768，mlp_dim=None → 3072
+    # Shape：[batch_size, seq_len, 768] → [batch_size, seq_len, 3072] → [batch_size, seq_len, 768]
+    mlp_dim: int | None = None
+
+    # dropout：Dropout 概率
+    # 0.1：训练时每个元素有 10% 的概率被置为 0
+    # 0.0：不进行随机丢弃
+    # Dropout 不改变 Shape
     dropout: float = 0.0
+
+    # dtype_mm：矩阵运算的数据类型（Matrix Multiplication Dtype）
+    # "float32"：32 位浮点数
+    # "float16"：16 位浮点数
+    # "bfloat16"：16 位 Brain Floating Point
     dtype_mm: str = "float32"
 
+    # @nn.compact：Flax Linen 装饰器
+    # 允许在 __call__() 中直接创建和调用子模块
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
-        """Applies Transformer MlpBlock module."""
+    def __call__(
+        # self：当前 MlpBlock 实例
+        self,
+
+        # x：输入 Token 特征
+        # Shape：[batch_size, seq_len, features]
+        # 例如：[2, 197, 768]
+        x,
+
+        # deterministic：是否使用确定性模式
+        # True：关闭 Dropout，通常用于推理
+        # False：允许启用 Dropout，通常用于训练
+        deterministic=True,
+    ):  # noqa: FBT002
+        """执行 Transformer MLP Block 的前向传播"""
+
+        # inits：保存 Dense 层参数初始化方法的字典
         inits = {
+            # kernel_init：权重矩阵（Weight Matrix）的初始化方法
+            # xavier_uniform()：Xavier Uniform Initialization（Xavier 均匀初始化）
+            # 对二维权重 [input_dim, output_dim]：
+            #   fan_in = input_dim
+            #   fan_out = output_dim
+            #   初始化范围为 ±sqrt(6 / (fan_in + fan_out))
             "kernel_init": nn.initializers.xavier_uniform(),
-            "bias_init": nn.initializers.normal(stddev=1e-6),
+
+            # bias_init：偏置向量（Bias Vector）的初始化方法
+            # normal()：使用正态分布随机初始化
+            "bias_init": nn.initializers.normal(
+                # stddev：正态分布的标准差（Standard Deviation）
+                # 1e-6 = 0.000001，均值默认为 0
+                stddev=1e-6,
+            ),
         }
 
-        _, _, d = x.shape  # n,l,d
-        x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(x)
-        x = nn.gelu(x)
-        x = nn.Dropout(rate=self.dropout)(x, deterministic)
-        return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
+        # x.shape：[batch_size, seq_len, features]
+        # 第一个 _：batch_size，此处不使用
+        # 第二个 _：seq_len，此处不使用
+        # d：features，输入 Token 的特征维度
+        # 例如：x.shape=[2, 197, 768] → d=768
+        _, _, d = x.shape
 
+        # ============================================================
+        # 1. 第一层全连接层（Fully Connected Layer）
+        # ============================================================
+
+        # nn.Dense：对输入最后一个特征维度执行线性变换
+        # 公式：output = x @ kernel + bias
+        #
+        # 输入 x：[batch_size, seq_len, features]
+        # 权重 kernel：[features, mlp_dim]
+        # 偏置 bias：[mlp_dim]
+        # 输出 x：[batch_size, seq_len, mlp_dim]
+        #
+        # 例如：
+        # x：[2, 197, 768]
+        # kernel：[768, 3072]
+        # bias：[3072]
+        # 输出：[2, 197, 3072]
+        x = nn.Dense(
+            # features：Dense 层的输出特征维度
+            # self.mlp_dim 非零且非 None 时使用指定值，否则使用 4*d
+            # 例如：d=768，self.mlp_dim=None → 3072
+            self.mlp_dim or 4 * d,
+
+            # dtype：Dense 层计算使用的数据类型
+            dtype=self.dtype_mm,
+
+            # **inits：展开初始化参数字典
+            # *inits：只解开键
+            # **inits：解开键值对
+            # 等价于分别传入 kernel_init 和 bias_init
+            **inits,
+        )(
+            # inputs：输入 Token 特征
+            # Shape：[batch_size, seq_len, features]
+            x,
+        )
+
+        # ============================================================
+        # 2. GELU 激活函数
+        # ============================================================
+
+        # GELU：Gaussian Error Linear Unit（高斯误差线性单元）
+        # 公式：GELU(x) = x * Φ(x)
+        # Φ(x)：标准正态分布的累积分布函数
+        # 作用：引入非线性变换，不改变 Shape
+        x = nn.gelu(
+            # x：第一层 Dense 的输出
+            # Shape：[batch_size, seq_len, mlp_dim]
+            x,
+        )
+
+        # ============================================================
+        # 3. Dropout
+        # ============================================================
+
+        # Dropout：训练时随机丢弃部分隐藏层特征
+        # 例如：dropout=0.1，保留的元素按 1/(1-0.1) 缩放
+        # 输入/输出：[batch_size, seq_len, mlp_dim]
+        x = nn.Dropout(
+            # rate：随机丢弃概率
+            rate=self.dropout,
+        )(
+            # inputs：需要执行 Dropout 的输入张量
+            # Shape：[batch_size, seq_len, mlp_dim]
+            x,
+
+            # deterministic：是否关闭 Dropout
+            # True：关闭；False：启用（当 rate>0）
+            deterministic,
+        )
+
+        # ============================================================
+        # 4. 第二层全连接层（Fully Connected Layer）
+        # ============================================================
+
+        # 将隐藏层特征维度恢复为原始 features
+        # 公式：output = x @ kernel + bias
+        #
+        # 输入 x：[batch_size, seq_len, mlp_dim]
+        # 权重 kernel：[mlp_dim, features]
+        # 偏置 bias：[features]
+        # 输出：[batch_size, seq_len, features]
+        #
+        # 例如：
+        # x：[2, 197, 3072]
+        # kernel：[3072, 768]
+        # bias：[768]
+        # 输出：[2, 197, 768]
+        #
+        # 注意：此处不再执行 Dropout
+        # 外层 Encoder1DBlock 会对 MLP 输出再次执行 Dropout
+        return nn.Dense(
+            # features：输出特征维度，恢复为输入的 d
+            d,
+
+            # dtype：Dense 层计算使用的数据类型
+            dtype=self.dtype_mm,
+
+            # **inits：权重和偏置的初始化方法
+            **inits,
+        )(
+            # inputs：经过 GELU 和 Dropout 的隐藏层特征
+            # Shape：[batch_size, seq_len, mlp_dim]
+            x,
+        )
 
 class Encoder1DBlock(nn.Module):
-    """Single transformer encoder block (MHSA + MLP)."""
+    """单层 Transformer Encoder Block（Multi-Head Self-Attention + MLP）"""
 
-    mlp_dim: int | None = None  # Defaults to 4x input dim
+    # mlp_dim：多层感知机（Multi-Layer Perceptron）的隐藏层维度
+    # None：默认使用输入特征维度 features 的 4 倍（由 MlpBlock 内部实现）
+    #
+    # 例如：
+    #   features = 768
+    #   mlp_dim = None → 3072
+    #
+    # MLP 内部典型 Shape 变化：
+    #   [batch_size, seq_len, 768]
+    #       ↓
+    #   [batch_size, seq_len, 3072]
+    #       ↓
+    #   [batch_size, seq_len, 768]
+    mlp_dim: int | None = None
+
+    # num_heads：多头注意力（Multi-Head Attention）的注意力头数量
+    #
+    # 例如：
+    #   features = 768
+    #   num_heads = 12
+    #   head_dim = 768 // 12 = 64
+    #
+    # Q、K、V 的典型 Shape：
+    #   [batch_size, seq_len, num_heads, head_dim]
     num_heads: int = 12
+
+    # dropout：Dropout 概率
+    #
+    # 例如：
+    #   dropout = 0.1：训练时随机将部分元素置为 0
+    #   dropout = 0.0：不进行随机丢弃
+    #
+    # Dropout 不改变 Shape
     dropout: float = 0.0
+
+    # dtype_mm：矩阵运算使用的数据类型（Matrix Multiplication Dtype）
+    #
+    # 例如：
+    #   "float32"：32 位浮点数
+    #   "float16"：16 位浮点数
+    #   "bfloat16"：16 位 Brain Floating Point
+    #
+    # 控制下方 LayerNorm、Attention、MLP 中相关计算的数据类型
+    # 具体计算精度由各子模块实现决定
     dtype_mm: str = "float32"
 
+    # @nn.compact：
+    #   Flax Linen 装饰器
+    #   允许在 __call__() 中直接创建并调用子模块
+    #   例如 nn.LayerNorm、nn.MultiHeadDotProductAttention、MlpBlock
     @nn.compact
     def __call__(self, x, deterministic=True):  # noqa: FBT002
+
+        # x：输入 Token 特征
+        # Shape：[batch_size, seq_len, features]
+        #
+        # batch_size：批量大小
+        # seq_len：Token 序列长度
+        # features：每个 Token 的特征维度
+        #
+        # 例如：
+        #   x：[2, 197, 768]
+        #
+        # deterministic：是否使用确定性模式
+        #   True：关闭 Dropout，通常用于推理
+        #   False：启用 Dropout，通常用于训练
+
+        # out：保存 Transformer Block 的中间计算结果
+        #
+        # 后续保存：
+        #   out["sa"]：Self-Attention 的输出
+        #   out["+sa"]：第一次残差连接后的输出
+        #   out["mlp"]：MLP 的输出
+        #   out["+mlp"]：第二次残差连接后的输出
         out = {}
+
+        # activation_sharding_constraint()：
+        #   对激活张量施加设备分片约束（Activation Sharding Constraint）
+        #
+        # 作用：
+        #   指定或约束 x 在多个计算设备上的分布方式
+        #   具体分片规则由 sharding 模块内部实现决定
+        #
+        # 注意：
+        #   不改变 x 的逻辑 Shape
+        #
+        # x：[batch_size, seq_len, features]
         x = sharding.activation_sharding_constraint(x)
+
+        # ============================================================
+        # 1. Multi-Head Self-Attention（多头自注意力）
+        # ============================================================
+
+        # nn.LayerNorm()：层归一化（Layer Normalization）
+        #
+        # dtype=self.dtype_mm：
+        #   指定 LayerNorm 输出及相关计算使用的数据类型
+        #
+        # 默认对最后一个特征维度 features 进行归一化
+        #
+        # 输入 x：[batch_size, seq_len, features]
+        # 输出 y：[batch_size, seq_len, features]
+        #
+        # 例如：
+        #   x：[2, 197, 768]
+        #   y：[2, 197, 768]
+        #
+        # LayerNorm 不改变 Shape
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
+
+        # nn.MultiHeadDotProductAttention()：
+        #   多头点积注意力（Multi-Head Dot-Product Attention）
+        #
+        # num_heads=self.num_heads：
+        #   Attention Head 的数量
+        #
+        # kernel_init=nn.initializers.xavier_uniform()：
+        #   使用 Xavier Uniform 初始化注意力模块中的权重矩阵
+        #
+        # deterministic=deterministic：
+        #   控制注意力模块内部的 Dropout 是否启用
+        #
+        # dtype=self.dtype_mm：
+        #   Attention 模块计算使用的数据类型
+        #
+        # (y, y)：
+        #   第一个 y：Query 的输入
+        #   第二个 y：Key 和 Value 的输入
+        #
+        # 因为 Query、Key、Value 都来自同一个 Token 序列，
+        # 所以这里执行的是 Self-Attention（自注意力）
+        #
+        # 输入：
+        #   Query 输入：[batch_size, seq_len, features]
+        #   Key/Value 输入：[batch_size, seq_len, features]
+        #
+        # 假设：
+        #   features = 768
+        #   num_heads = 12
+        #   head_dim = 768 // 12 = 64
+        #
+        # Q、K、V 线性投影后的典型 Shape：
+        #   Q：[batch_size, seq_len, num_heads, head_dim]
+        #   K：[batch_size, seq_len, num_heads, head_dim]
+        #   V：[batch_size, seq_len, num_heads, head_dim]
+        #
+        # Attention 权重：
+        #   [batch_size, num_heads, seq_len, seq_len]
+        #
+        # 多头注意力输出：
+        #   [batch_size, seq_len, features]
+        #
+        # out["sa"]：保存 Self-Attention 的输出
         y = out["sa"] = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             kernel_init=nn.initializers.xavier_uniform(),
             deterministic=deterministic,
             dtype=self.dtype_mm,
         )(y, y)
+
+        # 对 Self-Attention 输出施加设备分片约束
+        #
+        # 输入 y：[batch_size, seq_len, features]
+        # 输出 y：[batch_size, seq_len, features]
+        #
+        # 不改变逻辑 Shape
         y = sharding.activation_sharding_constraint(y)
+
+        # 对 Self-Attention 输出进行 Dropout
+        #
+        # rate=self.dropout：随机丢弃概率
+        # deterministic：是否关闭 Dropout
+        #
+        # 输入 y：[batch_size, seq_len, features]
+        # 输出 y：[batch_size, seq_len, features]
+        #
+        # Dropout 不改变 Shape
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
+
+        # 第一次残差连接（Residual Connection）
+        #
+        # x：进入 Self-Attention 分支之前的原始输入
+        # y：经过 LayerNorm、Self-Attention、Dropout 后的输出
+        #
+        # x：[batch_size, seq_len, features]
+        # y：[batch_size, seq_len, features]
+        #
+        # x + y：逐元素相加（Element-wise Addition）
+        #
+        # 两个张量 Shape 相同，不需要广播
+        #
+        # 计算公式：
+        #   x_new = x_old + Dropout(SelfAttention(LayerNorm(x_old)))
+        #
+        # 输出：
+        #   x：[batch_size, seq_len, features]
+        #
+        # out["+sa"]：保存第一次残差连接后的结果
         x = out["+sa"] = x + y
 
+        # ============================================================
+        # 2. MLP（多层感知机）
+        # ============================================================
+
+        # 对第一次残差连接后的 x 再次进行 LayerNorm
+        #
+        # 输入 x：[batch_size, seq_len, features]
+        # 输出 y：[batch_size, seq_len, features]
+        #
+        # 注意：
+        #   这里使用的是新的 LayerNorm 子模块，
+        #   与 Self-Attention 前面的 LayerNorm 参数不共享
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
+
+        # MlpBlock：多层感知机模块
+        #
+        # mlp_dim=self.mlp_dim：
+        #   MLP 中间隐藏层的特征维度
+        #
+        # dropout=self.dropout：
+        #   MLP 内部的 Dropout 概率
+        #
+        # dtype_mm=self.dtype_mm：
+        #   MLP 内部矩阵运算使用的数据类型
+        #
+        # (y, deterministic)：
+        #   y：输入 Token 特征
+        #   deterministic：是否关闭 Dropout
+        #
+        # 输入 y：[batch_size, seq_len, features]
+        #
+        # 假设：
+        #   features = 768
+        #   mlp_dim = 3072
+        #
+        # MLP 内部典型 Shape 变化：
+        #   [batch_size, seq_len, 768]
+        #       ↓
+        #   [batch_size, seq_len, 3072]
+        #       ↓
+        #   [batch_size, seq_len, 768]
+        #
+        # 输出 y：[batch_size, seq_len, features]
+        #
+        # out["mlp"]：保存 MLP 的输出
         y = out["mlp"] = MlpBlock(
             mlp_dim=self.mlp_dim,
             dropout=self.dropout,
             dtype_mm=self.dtype_mm,
         )(y, deterministic)
+
+        # 对 MLP 输出施加设备分片约束
+        #
+        # 输入 y：[batch_size, seq_len, features]
+        # 输出 y：[batch_size, seq_len, features]
         y = sharding.activation_sharding_constraint(y)
+
+        # 对 MLP 输出再次进行 Dropout
+        #
+        # 输入 y：[batch_size, seq_len, features]
+        # 输出 y：[batch_size, seq_len, features]
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
+
+        # 第二次残差连接（Residual Connection）
+        #
+        # x：第一次残差连接后的特征
+        # y：经过第二次 LayerNorm、MLP、Dropout 后的输出
+        #
+        # x：[batch_size, seq_len, features]
+        # y：[batch_size, seq_len, features]
+        #
+        # x + y：逐元素相加，不需要广播
+        #
+        # 计算公式：
+        #   x_new = x_old + Dropout(MLP(LayerNorm(x_old)))
+        #
+        # 输出 x：[batch_size, seq_len, features]
+        #
+        # out["+mlp"]：保存第二次残差连接后的结果
         x = out["+mlp"] = x + y
+
+        # 对 Transformer Block 最终输出施加设备分片约束
+        #
+        # x：[batch_size, seq_len, features]
+        #
+        # 不改变逻辑 Shape
         x = sharding.activation_sharding_constraint(x)
+
+        # 返回：
+        #
+        # x：Transformer Encoder Block 的最终输出
+        #   [batch_size, seq_len, features]
+        #
+        # out：保存中间计算结果的字典
+        #   out["sa"]：Self-Attention 输出
+        #   out["+sa"]：第一次残差连接后的输出
+        #   out["mlp"]：MLP 输出
+        #   out["+mlp"]：第二次残差连接后的输出
         return x, out
 
 
 class Encoder(nn.Module):
-    """Transformer Model Encoder for sequence to sequence translation."""
+    """Transformer Encoder：由多个 Encoder1DBlock 堆叠组成的编码器"""
 
+    # depth：Transformer Encoder Block 的层数
+    # 例如：depth=12，表示依次执行 12 个 Encoder1DBlock
+    # 每层包含 Multi-Head Self-Attention、MLP 和残差连接
     depth: int
-    mlp_dim: int | None = None  # Defaults to 4x input dim
+
+    # mlp_dim：MLP（Multi-Layer Perceptron）的隐藏层维度
+    # None：默认使用输入特征维度 features 的 4 倍
+    # 例如：features=768 → mlp_dim=3072
+    # Shape：[batch_size, seq_len, 768] → [batch_size, seq_len, 3072] → [batch_size, seq_len, 768]
+    mlp_dim: int | None = None
+
+    # num_heads：多头注意力（Multi-Head Attention）的注意力头数量
+    # 例如：features=768，num_heads=12 → head_dim=64
+    # Q/K/V：[batch_size, seq_len, num_heads, head_dim]
+    # 例如：[2, 197, 12, 64]
     num_heads: int = 12
+
+    # dropout：Dropout 概率
+    # 0.1：训练时随机丢弃约 10% 的元素
+    # 0.0：不进行随机丢弃
+    # Dropout 不改变 Shape
     dropout: float = 0.0
+
+    # scan：是否使用 JAX/Flax Scan 机制
+    # True：通过 nn.scan 将多个 Encoder1DBlock 组织为循环结构
+    # False：使用 Python for 循环逐层创建 Encoder1DBlock
+    # Scan 可减少循环体在编译计算图中的重复展开
+    # 不改变网络层数及最终输出 Shape
     scan: bool = False
+
+    # remat_policy：重计算策略（Rematerialization Policy）
+    # Rematerialization：反向传播时重新计算部分中间结果，以减少显存占用
+    # "nothing_saveable"：不允许保存重计算区域内的中间残差
+    # 通过计算时间换取显存空间
+    # 本代码仅在 scan=True 时使用该策略
     remat_policy: str = "nothing_saveable"
+
+    # dtype_mm：矩阵运算的数据类型（Matrix Multiplication Dtype）
+    # "float32"：32 位浮点数
+    # "float16"：16 位浮点数
+    # "bfloat16"：Brain Floating Point 16
+    # 控制 Encoder 内部相关模块的计算数据类型，不改变 Shape
     dtype_mm: str = "float32"
 
+    # @nn.compact：Flax Linen 装饰器
+    # 允许在 __call__() 中直接创建子模块和参数
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(
+        # self：当前 Encoder 实例
+        self,
+
+        # x：输入 Token 特征
+        # Shape：[batch_size, seq_len, features]
+        # 例如：[2, 197, 768]
+        x,
+
+        # deterministic：是否使用确定性模式
+        # True：关闭 Dropout，通常用于推理
+        # False：允许启用 Dropout，通常用于训练
+        deterministic=True,
+    ):
+
+        # out：保存各层 Transformer Encoder Block 的中间输出
+        # 例如：
+        # out["block00"]：第 1 层的中间结果字典
+        # out["block01"]：第 2 层的中间结果字典
+        # ...
+        # out["block11"]：第 12 层的中间结果字典
         out = {}
 
+        # ============================================================
+        # 1. scan=True：使用 Scan + Rematerialization
+        # ============================================================
+
         if self.scan:
+
+            # nn.remat：Rematerialization（重计算）
+            # 对 Encoder1DBlock 进行包装，使部分中间结果在反向传播时重新计算
+            # 减少训练过程中需要保存的激活值，从而降低显存占用
+            #
+            # block：经过 nn.remat 包装后的 Encoder1DBlock 模块
+            # 注意：此处只是构造模块变换，还没有执行前向传播
             block = nn.remat(
+                # target：需要进行重计算包装的模块
+                # Encoder1DBlock：单层 Transformer Encoder Block
                 Encoder1DBlock,
+
+                # prevent_cse：是否阻止公共子表达式消除
+                # CSE = Common Subexpression Elimination（公共子表达式消除）
+                # False：不阻止编译器对相同计算进行公共子表达式消除
+                # True：尝试阻止相关优化
                 prevent_cse=False,
-                static_argnums=(2,),  # 0=self, 2=deterministic
-                policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
+
+                # static_argnums：指定 __call__() 中的静态参数索引
+                # 静态参数：在 JAX 跟踪、编译时作为静态值处理
+                #
+                # Encoder1DBlock.__call__(self, x, deterministic=True)
+                # 索引：
+                #   0 → self
+                #   1 → x
+                #   2 → deterministic
+                #
+                # (2,)：将 deterministic 作为静态参数
+                # 注意：(2,) 是单元素元组，不能写成 (2)
+                static_argnums=(2,),
+
+                # policy：Checkpoint / Rematerialization 的保存策略
+                #
+                # jax.checkpoint_policies：JAX 提供的重计算策略集合
+                # self.remat_policy：策略名称字符串
+                #
+                # getattr(object, name, default)：
+                #   获取 object 中名称为 name 的属性
+                #   属性不存在时返回 default
+                #
+                # 例如：
+                # self.remat_policy="nothing_saveable"
+                # → jax.checkpoint_policies.nothing_saveable
+                #
+                # None：策略名称不存在时使用的默认值
+                policy=getattr(
+                    # object：保存重计算策略的对象
+                    jax.checkpoint_policies,
+
+                    # name：需要查找的策略名称
+                    self.remat_policy,
+
+                    # default：属性不存在时返回 None
+                    None,
+                ),
             )
+
+            # ========================================================
+            # 2. nn.scan：循环执行 depth 个 Encoder1DBlock
+            # ========================================================
+
+            # nn.scan：Flax Linen 的循环模块变换
+            # 将重复的 Encoder1DBlock 组织为一个循环计算结构
+            #
+            # 输入 x：[batch_size, seq_len, features]
+            # 每层输出 x：[batch_size, seq_len, features]
+            #
+            # 假设：
+            # depth=12，x.shape=[2, 197, 768]
+            #
+            # 执行过程：
+            # Block 0：[2, 197, 768] → [2, 197, 768]
+            # Block 1：[2, 197, 768] → [2, 197, 768]
+            # ...
+            # Block 11：[2, 197, 768] → [2, 197, 768]
+            #
+            # x：最后一层 Encoder1DBlock 的输出
+            # scan_out：各层返回的中间结果，沿层数维度堆叠
+            #
+            # 例如：
+            # scan_out["+sa"]：[depth, batch_size, seq_len, features]
+            # scan_out["mlp"]：[depth, batch_size, seq_len, features]
             x, scan_out = nn.scan(
+                # target：需要重复执行的模块
+                # block：经过 nn.remat 包装的 Encoder1DBlock
                 block,
+
+                # variable_axes：指定模块变量沿哪个轴进行 Scan
+                #
+                # {"params": 0}：
+                #   params：Flax 参数集合（Parameters）
+                #   0：参数张量的第 0 维作为层数维度
+                #
+                # 例如：
+                # 单层 Dense 权重：[768, 3072]
+                # depth=12 时，Scan 参数组织为：[12, 768, 3072]
+                #
+                # 每层使用不同的参数切片，不共享权重
                 variable_axes={"params": 0},
-                split_rngs={"params": True, "dropout": True},
+
+                # split_rngs：是否为各层拆分随机数生成器
+                # RNG = Random Number Generator（随机数生成器）
+                #
+                # "params": True：
+                #   为每层参数初始化生成不同的随机密钥
+                #
+                # "dropout": True：
+                #   为每层 Dropout 生成不同的随机密钥
+                #
+                # True：沿 Scan 迭代拆分 RNG
+                # False：不沿迭代拆分 RNG
+                split_rngs={
+                    "params": True,
+                    "dropout": True,
+                },
+
+                # in_axes：输入参数如何沿 Scan 迭代维度传递
+                #
+                # nn.broadcast：
+                #   每次迭代接收相同的非 carry 输入参数
+                #
+                # 此处 Encoder1DBlock 的 x 是 carry：
+                #   第 1 层输出 x → 第 2 层输入 x
+                #   第 2 层输出 x → 第 3 层输入 x
+                #
+                # deterministic 则在各层保持相同
                 in_axes=nn.broadcast,
+
+                # length：Scan 循环次数
+                # self.depth：Transformer Encoder Block 的层数
+                # 例如：depth=12 → 执行 12 次
                 length=self.depth,
             )(
+                # name：Scan 模块的名称
+                # 用于 Flax 参数树中的模块命名
                 name="encoderblock",
+
+                # dtype_mm：各层矩阵运算的数据类型
                 dtype_mm=self.dtype_mm,
+
+                # mlp_dim：各层 MLP 的隐藏层维度
                 mlp_dim=self.mlp_dim,
+
+                # num_heads：各层 Attention Head 的数量
                 num_heads=self.num_heads,
+
+                # dropout：各层 Dropout 概率
                 dropout=self.dropout,
-            )(x, deterministic)
+            )(
+                # x：第一层 Encoder1DBlock 的输入
+                # Shape：[batch_size, seq_len, features]
+                x,
+
+                # deterministic：是否关闭 Dropout
+                # 各层使用相同的确定性模式
+                deterministic,
+            )
+
+            # ========================================================
+            # 3. 将 scan_out 拆分为各层独立的中间结果
+            # ========================================================
+
+            # scan_out 中的中间结果沿第 0 维堆叠
+            #
+            # 例如：
+            # scan_out["sa"]：[12, 2, 197, 768]
+            # scan_out["+sa"]：[12, 2, 197, 768]
+            # scan_out["mlp"]：[12, 2, 197, 768]
+            # scan_out["+mlp"]：[12, 2, 197, 768]
+            #
+            # 目标：
+            # out["block00"]：第 1 层的中间结果
+            # out["block01"]：第 2 层的中间结果
+            # ...
+            # out["block11"]：第 12 层的中间结果
+
             for lyr in range(self.depth):
-                out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
+
+                # lyr：当前层索引（Layer Index）
+                # range(12) → 0, 1, 2, ..., 11
+                #
+                # f"block{lyr:02d}"：
+                #   f-string：格式化字符串
+                #   02d：将整数格式化为至少 2 位，不足补 0
+                #
+                # 例如：
+                # lyr=0  → "block00"
+                # lyr=1  → "block01"
+                # lyr=11 → "block11"
+                #
+                # jax.tree.map：对 PyTree 中的每个叶子节点执行函数
+                # PyTree：JAX 的嵌套数据结构，例如 dict、list、tuple
+                #
+                # 这里对 scan_out 中的每个张量取第 lyr 层
+                out[f"block{lyr:02d}"] = jax.tree.map(
+                    # lambda：匿名函数（Anonymous Function）
+                    #
+                    # o：scan_out 中的某个叶子张量
+                    # 例如：[depth, batch_size, seq_len, features]
+                    #
+                    # lyr=lyr：将当前循环层索引绑定为默认参数
+                    # o[lyr]：提取该张量的第 lyr 层
+                    #
+                    # 例如：
+                    # o.shape=[12, 2, 197, 768]
+                    # lyr=3
+                    # o[3].shape=[2, 197, 768]
+                    lambda o, lyr=lyr: o[lyr],
+
+                    # tree：需要遍历的 PyTree
+                    # scan_out：所有 Encoder Block 的中间结果
+                    scan_out,
+                )
+
+        # ============================================================
+        # 4. scan=False：使用普通 for 循环逐层构建 Encoder
+        # ============================================================
+
         else:
+
             # Input Encoder
+            # 通过 Python for 循环依次创建 depth 个 Encoder1DBlock
+            #
+            # 每层具有独立参数，不共享权重
+            # 每层的输出 x 作为下一层的输入
+            #
+            # 例如：depth=12
+            # encoderblock_0 → encoderblock_1 → ... → encoderblock_11
+
             for lyr in range(self.depth):
+
+                # lyr：当前 Transformer Encoder Block 的层索引
+                # 例如：depth=12 → lyr=0,1,...,11
+
+                # block_cur：当前层的 Encoder1DBlock 实例
                 block_cur = Encoder1DBlock(
+                    # name：当前 Encoder Block 的模块名称
+                    # 例如：
+                    # lyr=0 → "encoderblock_0"
+                    # lyr=1 → "encoderblock_1"
+                    # lyr=11 → "encoderblock_11"
+                    #
+                    # 不同名称对应不同子模块参数
                     name=f"encoderblock_{lyr}",
+
+                    # dtype_mm：当前 Block 的矩阵运算数据类型
                     dtype_mm=self.dtype_mm,
+
+                    # mlp_dim：当前 Block 的 MLP 隐藏层维度
+                    # None 时使用 4*features
                     mlp_dim=self.mlp_dim,
+
+                    # num_heads：当前 Block 的 Attention Head 数量
                     num_heads=self.num_heads,
+
+                    # dropout：当前 Block 的 Dropout 概率
                     dropout=self.dropout,
                 )
-                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
-            out["pre_ln"] = x  # Alias for last block, but without the number in it.
 
-        return nn.LayerNorm(name="encoder_norm", dtype=self.dtype_mm)(x), out
+                # 调用当前 Encoder1DBlock 的前向传播
+                #
+                # 输入 x：[batch_size, seq_len, features]
+                # 输出 x：[batch_size, seq_len, features]
+                #
+                # block_cur 返回：
+                #   x：当前 Block 的最终输出
+                #   out：当前 Block 的中间结果字典
+                #
+                # out[f"block{lyr:02d}"]：保存当前层中间结果
+                x, out[f"block{lyr:02d}"] = block_cur(
+                    # x：当前层输入
+                    # 第 1 层：Encoder 的原始输入
+                    # 后续层：上一层 Encoder1DBlock 的输出
+                    # Shape：[batch_size, seq_len, features]
+                    x,
+
+                    # deterministic：是否关闭 Dropout
+                    deterministic,
+                )
+
+            # pre_ln：Pre-LayerNorm Output（最终归一化前的输出）
+            #
+            # 保存最后一层 Encoder1DBlock 的输出
+            # 此时尚未执行 Encoder 最后的 LayerNorm
+            #
+            # Shape：[batch_size, seq_len, features]
+            #
+            # 例如：depth=12
+            # out["pre_ln"] 与最后一层的最终输出 x 指向相同的张量
+            # 数值等于 out["block11"]["+mlp"]
+            #
+            # 注意：这是引用同一个张量，不会复制数据
+            out["pre_ln"] = x
+
+        # ============================================================
+        # 5. 最终 LayerNorm + 返回结果
+        # ============================================================
+
+        # nn.LayerNorm：Layer Normalization（层归一化）
+        #
+        # 对所有 Encoder Block 的最终输出进行归一化
+        # 默认沿最后一个特征维度 features 计算均值和方差
+        #
+        # 输入 x：[batch_size, seq_len, features]
+        # 输出 x：[batch_size, seq_len, features]
+        #
+        # 例如：[2, 197, 768] → [2, 197, 768]
+        #
+        # 注意：
+        # 这里的 LayerNorm 是整个 Encoder 的最终归一化层
+        # 与各个 Encoder1DBlock 内部的 LayerNorm 参数不共享
+
+        return nn.LayerNorm(
+            # name：最终 LayerNorm 子模块的名称
+            # 在 Flax 参数树中使用 "encoder_norm"
+            name="encoder_norm",
+
+            # dtype：归一化模块的计算及输出数据类型
+            dtype=self.dtype_mm,
+        )(
+            # x：最后一个 Encoder1DBlock 的输出
+            # Shape：[batch_size, seq_len, features]
+            x,
+        ), out
 
 
 class MAPHead(nn.Module):
@@ -380,18 +1175,56 @@ class _Module(nn.Module):
         # x：[batch_size, patch_rows * patch_cols, features]
         x = jnp.reshape(x, [n, h * w, c])
 
-        # Add posemb before adding extra token.
+        # jnp.tile(cls, [n, 1, 1])：将 cls 沿着 batch_size 维度复制 n 次
+        #   n：沿着 batch_size 维度复制 n 次
+        #   1：Token 维度不复制
+        #   1：features 维度不复制
+        #
+        # cls：[1, 1, features]
+        # jnp.tile(cls, [n, 1, 1])：[batch_size, 1, features]
+        #
+        # jnp.concatenate(..., axis=1)：沿 Token 维度进行拼接
+        #   axis=1：Token 序列维度
+        #   将 CLS Token 添加到所有 Patch Tokens 的最前面
+        #
+        # 输入：
+        #   1) jnp.tile(cls, [n, 1, 1])：[batch_size, 1, features]
+        #   2) x：[batch_size, patch_rows * patch_cols, features]
+        #
+        # 输出（不会发生广播）：
+        #   x：[batch_size, 1 + patch_rows * patch_cols, features]
+        # 
+        # out["with_posemb"] 存放添加位置编码后的输入 x
         x = out["with_posemb"] = x + get_posemb(self, self.posemb, (h, w), c, "pos_embedding", jnp.float32)
 
+        # 特征池化方式 tok：使用额外添加的 CLS Token 进行池化
         if self.pool_type == "tok":
+
+            # cls：[1, 1, features]
             cls = self.param("cls", nn.initializers.zeros, (1, 1, c), x.dtype)
+
+            # jnp.tile(cls, [n, 1, 1])：将 cls 沿着 batch_size 维度复制 n 次
+            # n：沿着 batch_size 维度复制 n 次
+            # 1：Token 维度不复制
+            # 1：features 维度不复制
+            # 输入：
+            #   1) jnp.tile(cls, [n, 1, 1])：[batch_size, 1, features]
+            #   2) x：[batch_size, patch_rows * patch_cols, features]
+            # 输出（不会发生广播）：
+            #   x：[batch_size, 1 + patch_rows * patch_cols, features]
             x = jnp.concatenate([jnp.tile(cls, [n, 1, 1]), x], axis=1)
 
-        n, _, c = x.shape  # n,l,d
+        # n = batch_size, 
+        # c = features
+        n, _, c = x.shape 
+
+        # 随机丢弃
         x = nn.Dropout(rate=self.dropout)(x, not train)
 
-        # Kevin edit: now cast back to dtype_mm (potentially half precision)
+        # 使用较低精度的数据类型可以减少显存占用，
+        # 并可能提高后续 Transformer 矩阵运算的速度。
         x = x.astype(self.dtype_mm)
+
 
         x, out["encoder"] = Encoder(
             depth=self.depth,
