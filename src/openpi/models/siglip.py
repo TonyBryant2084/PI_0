@@ -122,6 +122,7 @@ def get_posemb(
 ):
     # 1. "learn"：可学习位置编码（Learnable Positional Embedding）
     if typ == "learn":
+        # param：[1, patch_rows * patch_cols, width]
         return self.param(
             # 1. 参数名称
             name,
@@ -140,7 +141,6 @@ def get_posemb(
         return posemb_sincos_2d(*seqshape, width, dtype=dtype)
 
     raise ValueError(f"Unknown posemb type: {typ}")
-
 
 class MlpBlock(nn.Module):
     """Transformer MLP / Feed-Forward Block（多层感知机 / 前馈网络）"""
@@ -163,8 +163,8 @@ class MlpBlock(nn.Module):
     # "bfloat16"：16 位 Brain Floating Point
     dtype_mm: str = "float32"
 
-    # @nn.compact：Flax Linen 装饰器
-    # 允许在 __call__() 中直接创建和调用子模块
+    # @nn.compact 允许在 __call__() 方法内部创建参数或子模块
+    # 例如 self.param() 和 nn.Dense() 都可以在该方法中使用
     @nn.compact
     def __call__(
         # self：当前 MlpBlock 实例
@@ -683,12 +683,21 @@ class Encoder(nn.Module):
         deterministic=True,
     ):
 
-        # out：保存各层 Transformer Encoder Block 的中间输出
-        # 例如：
-        # out["block00"]：第 1 层的中间结果字典
-        # out["block01"]：第 2 层的中间结果字典
-        # ...
-        # out["block11"]：第 12 层的中间结果字典
+        # out = {
+        #     "block00": {
+        #         "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #         "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "+mlp": ...,  # Shape：[batch_size, seq_len, features] 
+        #     },
+        #     "block01": {
+        #         "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #         "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "+mlp": ...,  # Shape：[batch_size, seq_len, features] 
+        #     },
+        #     ...
+        # }
         out = {}
 
         # ============================================================
@@ -894,20 +903,6 @@ class Encoder(nn.Module):
             # 3. 将 scan_out 拆分为各层独立的中间结果
             # ========================================================
 
-            # scan_out 中的中间结果沿第 0 维堆叠
-            #
-            # 例如：
-            # scan_out["sa"]：[12, 2, 197, 768]
-            # scan_out["+sa"]：[12, 2, 197, 768]
-            # scan_out["mlp"]：[12, 2, 197, 768]
-            # scan_out["+mlp"]：[12, 2, 197, 768]
-            #
-            # 目标：
-            # out["block00"]：第 1 层的中间结果
-            # out["block01"]：第 2 层的中间结果
-            # ...
-            # out["block11"]：第 12 层的中间结果
-
             # range(self.depth)：返回一个可迭代的 range 实例，0 ~ self.depth-1
             # lyr：layer_index 表示每一层的下标
             for lyr in range(self.depth):
@@ -919,54 +914,67 @@ class Encoder(nn.Module):
                 #       tree,    # 需要遍历的 PyTree
                 #   )
                 #
-                # jax.tree.map
+                # jax.tree.map() = {
+                #     "sa":   ...,  # Shape：[depth, batch_size, seq_len, features]
+                #     "+sa":  ...,  # Shape：[depth, batch_size, seq_len, features]
+                #     "mlp":  ...,  # Shape：[depth, batch_size, seq_len, features]
+                #     "+mlp": ...,  # Shape：[depth, batch_size, seq_len, features]
+                # } 
+                #
+                # 02d：格式说明符
+                #   1) 0：不足指定宽度时，在左侧补零
+                #   2) 2：最小宽度为 2 位
+                #   3) d：十进制整数（Decimal Integer）
+                #
+                # out = {
+                #     "block00": {
+                #         "sa":   ...,  # Shape：[batch_size, seq_len, features]
+                #         "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+                #         "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+                #         "+mlp": ...,  # Shape：[batch_size, seq_len, features] 
+                #     },
+                #     "block01": {
+                #         "sa":   ...,  # Shape：[ batch_size, seq_len, features]
+                #         "+sa":  ...,  # Shape：[ batch_size, seq_len, features]
+                #         "mlp":  ...,  # Shape：[ batch_size, seq_len, features]
+                #         "+mlp": ...,  # Shape：[ batch_size, seq_len, features] 
+                #     },
+                #     ...
+                # }
                 out[f"block{lyr:02d}"] = jax.tree.map(
 
                     # 对每个叶子节点执行的函数
                     # 此时的 o 就是 scan_out 中每一组键值对的值
                     # o：[depth, batch_size, seq_len, features]
                     # 由于新 PyTree 会保留原来的容器结构，所以键会自动保留
+                    #
+                    # lambda：取出每个叶子节点 o，然后取出叶子节点的第 lyr 层结果
                     lambda o, lyr=lyr: o[lyr],
 
                     # 需要遍历的 PyTree
                     # scan_out = {
-                    #     "sa":   [depth, batch_size, seq_len, features],
-                    #     "+sa":  [depth, batch_size, seq_len, features],
-                    #     "mlp":  [depth, batch_size, seq_len, features],
-                    #     "+mlp": [depth, batch_size, seq_len, features],
+                    #     "sa":   ...,  # Shape：[depth, batch_size, seq_len, features]
+                    #     "+sa":  ...,  # Shape：[depth, batch_size, seq_len, features]
+                    #     "mlp":  ...,  # Shape：[depth, batch_size, seq_len, features]
+                    #     "+mlp": ...,  # Shape：[depth, batch_size, seq_len, features] 
                     # } 
                     scan_out,
                 )
 
         # ============================================================
-        # 4. scan=False：使用普通 for 循环逐层构建 Encoder
+        # 4. scan = False：使用普通 for 循环逐层构建 Encoder
         # ============================================================
 
         else:
+            # 使用 for 循环，创建一层 Encoder，使用一层 Encoder
 
-            # Input Encoder
-            # 通过 Python for 循环依次创建 depth 个 Encoder1DBlock
-            #
-            # 每层具有独立参数，不共享权重
-            # 每层的输出 x 作为下一层的输入
-            #
-            # 例如：depth=12
-            # encoderblock_0 → encoderblock_1 → ... → encoderblock_11
-
+            # range(self.depth)：返回一个可迭代的 range 实例，0 ~ self.depth-1
+            # lyr：layer_index 表示每一层的下标
             for lyr in range(self.depth):
 
-                # lyr：当前 Transformer Encoder Block 的层索引
-                # 例如：depth=12 → lyr=0,1,...,11
-
-                # block_cur：当前层的 Encoder1DBlock 实例
                 block_cur = Encoder1DBlock(
+
                     # name：当前 Encoder Block 的模块名称
-                    # 例如：
-                    # lyr=0 → "encoderblock_0"
-                    # lyr=1 → "encoderblock_1"
-                    # lyr=11 → "encoderblock_11"
-                    #
-                    # 不同名称对应不同子模块参数
                     name=f"encoderblock_{lyr}",
 
                     # dtype_mm：当前 Block 的矩阵运算数据类型
@@ -983,24 +991,12 @@ class Encoder(nn.Module):
                     dropout=self.dropout,
                 )
 
-                # 调用当前 Encoder1DBlock 的前向传播
-                #
-                # 输入 x：[batch_size, seq_len, features]
-                # 输出 x：[batch_size, seq_len, features]
-                #
-                # block_cur 返回：
-                #   x：当前 Block 的最终输出
-                #   out：当前 Block 的中间结果字典
-                #
-                # out[f"block{lyr:02d}"]：保存当前层中间结果
                 x, out[f"block{lyr:02d}"] = block_cur(
                     # x：当前层输入
-                    # 第 1 层：Encoder 的原始输入
-                    # 后续层：上一层 Encoder1DBlock 的输出
-                    # Shape：[batch_size, seq_len, features]
+                    # x：[batch_size, seq_len, features]
                     x,
 
-                    # deterministic：是否关闭 Dropout
+                    # deterministic：是否使用 Dropout
                     deterministic,
                 )
 
@@ -1009,13 +1005,7 @@ class Encoder(nn.Module):
             # 保存最后一层 Encoder1DBlock 的输出
             # 此时尚未执行 Encoder 最后的 LayerNorm
             #
-            # Shape：[batch_size, seq_len, features]
-            #
-            # 例如：depth=12
-            # out["pre_ln"] 与最后一层的最终输出 x 指向相同的张量
-            # 数值等于 out["block11"]["+mlp"]
-            #
-            # 注意：这是引用同一个张量，不会复制数据
+            # x：[batch_size, seq_len, features]
             out["pre_ln"] = x
 
         # ============================================================
@@ -1030,49 +1020,112 @@ class Encoder(nn.Module):
         # 输入 x：[batch_size, seq_len, features]
         # 输出 x：[batch_size, seq_len, features]
         #
-        # 例如：[2, 197, 768] → [2, 197, 768]
-        #
         # 注意：
         # 这里的 LayerNorm 是整个 Encoder 的最终归一化层
         # 与各个 Encoder1DBlock 内部的 LayerNorm 参数不共享
-
+        #
+        # 返回值：
+        # x：[batch_size, seq_len, features]
+        # out = {
+        #     "block00": {
+        #         "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #         "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "+mlp": ...,  # Shape：[batch_size, seq_len, features] 
+        #     },
+        #     "block01": {
+        #         "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #         "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #         "+mlp": ...,  # Shape：[batch_size, seq_len, features] 
+        #     },
+        #     ...
+        # }
         return nn.LayerNorm(
             # name：最终 LayerNorm 子模块的名称
-            # 在 Flax 参数树中使用 "encoder_norm"
             name="encoder_norm",
 
             # dtype：归一化模块的计算及输出数据类型
             dtype=self.dtype_mm,
         )(
             # x：最后一个 Encoder1DBlock 的输出
-            # Shape：[batch_size, seq_len, features]
+            # x：[batch_size, seq_len, features]
             x,
         ), out
 
-
+# MAPHead：Multihead Attention Pooling（多头注意力池化）
+# 通过可学习的 Probe Token，使用 Cross-Attention 聚合所有 Patch Tokens 的特征
 class MAPHead(nn.Module):
-    """Multihead Attention Pooling."""
 
-    mlp_dim: int | None = None  # Defaults to 4x input dim
+    # MLP 中间隐藏层维度，None 表示默认使用输入 features 的 4 倍
+    mlp_dim: int | None = None
+
+    # Attention Head 数量
     num_heads: int = 12
+
+    # 矩阵运算的数据类型
     dtype_mm: str = "float32"
 
+    # 允许在 __call__() 中创建参数和子模块
     @nn.compact
-    def __call__(self, x):
-        n, _, d = x.shape  # n,l,d
+    def __call__(
+        self,
+        x,
+    ):
+        # 参数：
+        #   self：当前 MAPHead 模块实例
+        #   x：Encoder 输出的 Patch Tokens，[batch_size, seq_len, features]
+
+        # n = batch_size，_ = seq_len（不使用），d = features
+        n, _, d = x.shape
+
+        # self.param()：创建或读取名为 "probe" 的可学习参数
+        # Xavier Uniform：初始化方法；x.dtype：参数数据类型
+        # probe：[1, 1, features]，作为 Cross-Attention 的 Query 输入
         probe = self.param("probe", nn.initializers.xavier_uniform(), (1, 1, d), x.dtype)
+
+        # jnp.tile(probe, [n, 1, 1])：沿 batch_size 维度复制 n 次，其余维度不变
+        # probe：[1, 1, features] → [batch_size, 1, features]
+        # 所有样本共享同一组可学习 Probe 参数，但 Attention 输出因图像而异
         probe = jnp.tile(probe, [n, 1, 1])
 
+        # Multi-Head Dot-Product Attention（多头点积注意力）
+        # num_heads：Attention Head 数量
+        # dtype：Attention 计算的数据类型
+        # kernel_init：使用 Xavier Uniform 初始化注意力投影权重
+        #
+        # (probe, x)：Query 来自 probe，Key/Value 来自 x，因此是 Cross-Attention
+        # Query 输入：[batch_size, 1, features]
+        # Key/Value 输入：[batch_size, seq_len, features]
+        #
+        # 假设 features=768，num_heads=12，head_dim=768//12=64：
+        # Q：[batch_size, 1, 12, 64]
+        # K：[batch_size, seq_len, 12, 64]
+        # V：[batch_size, seq_len, 12, 64]
+        # Attention 权重：[batch_size, 12, 1, seq_len]
+        #
+        # 作用：Probe 对所有 Patch Tokens 计算注意力权重，
+        #      根据权重对 Value 加权求和，将所有 Token 信息聚合到一个 Token 中
+        # x：[batch_size, 1, features]
         x = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             dtype=self.dtype_mm,
             kernel_init=nn.initializers.xavier_uniform(),
         )(probe, x)
 
+        # LayerNorm：沿 features 维度归一化
+        # x：[batch_size, 1, features] → y：[batch_size, 1, features]
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
-        x = x + MlpBlock(mlp_dim=self.mlp_dim, dtype=self.dtype_mm)(y)
-        return x[:, 0]
 
+        # MLP + Residual Connection（残差连接）
+        # MlpBlock：对归一化后的特征进行非线性变换，输出维度不变
+        # x = Attention 输出 + MLP 输出
+        # x：[batch_size, 1, features]
+        x = x + MlpBlock(mlp_dim=self.mlp_dim, dtype_mm=self.dtype_mm)(y)
+
+        # 提取唯一的全局 Token，作为整张图像的全局特征向量
+        # x[:, 0]：[batch_size, 1, features] → [batch_size, features]
+        return x[:, 0]
 
 # Vision Transformer 模型
 class _Module(nn.Module):
@@ -1108,11 +1161,12 @@ class _Module(nn.Module):
     # 2. "sincos2d"：使用二维正弦余弦位置编码
     posemb: str = "learn"
 
-    # rep_size：Representation Size（表示层输出维度）
-    # 1. int：创建指定输出维度的表示层，例如 rep_size=512，则表示层输出维度为 512
+    # rep_size：Representation Size（表示层的输出特征维度）
+    # 1. int：指定表示层的输出维度，例如 rep_size=512，输出维度为 512
+    #    非零整数在 if 判断中视为 True，因此会创建表示层
     # 2. bool：
-    #   1) True：创建输出维度为 width 的表示层
-    #   2) False：不创建额外的表示层
+    #    1) True：创建输出维度为 width 的表示层
+    #    2) False（默认）：不创建额外的表示层
     rep_size: int | bool = False
 
     # dropout：Dropout Rate（随机丢弃概率）
@@ -1163,6 +1217,7 @@ class _Module(nn.Module):
         # False：推理模式，关闭 Dropout
         train=False
     ):
+        # out：保存 ViT 各阶段中间结果的字典
         out = {}
 
         # 将 image 转成 float32 格式
@@ -1179,7 +1234,15 @@ class _Module(nn.Module):
         # channels：输入图像的通道数
         # features：每个 Patch 输出的特征维度
         #
-        # out["stem"] = nn.Conv(...)(image)：将结果存入 out dict，key 为 "stem"
+        # out：保存 ViT 各阶段中间结果的字典
+        # 
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        # } 
         x = out["stem"] = nn.Conv(
             # 卷积核个数
             features = self.width,
@@ -1203,29 +1266,29 @@ class _Module(nn.Module):
         # x：[batch_size, patch_rows * patch_cols, features]
         x = jnp.reshape(x, [n, h * w, c])
 
-        # jnp.tile(cls, [n, 1, 1])：将 cls 沿着 batch_size 维度复制 n 次
-        #   n：沿着 batch_size 维度复制 n 次
-        #   1：Token 维度不复制
-        #   1：features 维度不复制
-        #
-        # cls：[1, 1, features]
-        # jnp.tile(cls, [n, 1, 1])：[batch_size, 1, features]
-        #
-        # jnp.concatenate(..., axis=1)：沿 Token 维度进行拼接
-        #   axis=1：Token 序列维度
-        #   将 CLS Token 添加到所有 Patch Tokens 的最前面
-        #
-        # 输入：
-        #   1) jnp.tile(cls, [n, 1, 1])：[batch_size, 1, features]
-        #   2) x：[batch_size, patch_rows * patch_cols, features]
-        #
-        # 输出（不会发生广播）：
-        #   x：[batch_size, 1 + patch_rows * patch_cols, features]
+        # out：保存 ViT 各阶段中间结果的字典
         # 
-        # out["with_posemb"] 存放添加位置编码后的输入 x
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        # } 
         x = out["with_posemb"] = x + get_posemb(self, self.posemb, (h, w), c, "pos_embedding", jnp.float32)
 
-        # 特征池化方式 tok：使用额外添加的 CLS Token 进行池化
+        # 使用 CLS Token（Classification Token）作为整张图像的全局特征表示
+        # 分为两个阶段：
+        # Encoder 前：添加 CLS Token
+        #   1) 创建一个可学习的 CLS Token，Shape 为 [1, 1, features]
+        #   2) 将其复制到每个样本，并拼接到所有 Patch Tokens 的最前面
+        #   3) x 的 Shape 从 [batch_size, patch_rows * patch_cols, features] 变为 
+        #      [batch_size, 1 + patch_rows * patch_cols, features]
+        # 
+        # Encoder 后：提取 CLS Token
+        #   1) CLS Token 经过 Transformer 的 Self-Attention，与 Patch Tokens 交互，学习图像的全局特征
+        #   2) 使用 x[:, 0] 提取 CLS Token，Shape 为 [batch_size, features]
+        #   3) 使用 encoded[:, 1:] 去掉 CLS Token，保留所有 Patch Tokens 的特征
         if self.pool_type == "tok":
 
             # cls：[1, 1, features]
@@ -1253,7 +1316,36 @@ class _Module(nn.Module):
         # 并可能提高后续 Transformer 矩阵运算的速度。
         x = x.astype(self.dtype_mm)
 
-
+        # out：保存 ViT 各阶段中间结果的字典
+        #
+        # seq_len：
+        #   pool_type == "tok"：1 + patch_rows * patch_cols
+        #   pool_type != "tok"：patch_rows * patch_cols
+        #
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        #
+        #     # 3. 各层 Encoder Block 的中间结果
+        #     "encoder": {
+        #         "block00": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         "block01": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         # ...
+        #     },
+        # } 
         x, out["encoder"] = Encoder(
             depth=self.depth,
             mlp_dim=self.mlp_dim,
@@ -1264,66 +1356,676 @@ class _Module(nn.Module):
             dtype_mm=self.dtype_mm,
             name="Transformer",
         )(x, deterministic=not train)
+
+        # out：保存 ViT 各阶段中间结果的字典
+        #
+        # seq_len：
+        #   pool_type == "tok"：1 + patch_rows * patch_cols
+        #   pool_type != "tok"：patch_rows * patch_cols
+        #
+        # output_features：
+        #   self.rep_size 为 False：features
+        #   self.rep_size 为 True：features（rep_size = self.width）
+        #   self.rep_size 为正整数：rep_size
+        #
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        #
+        #     # 3. 各层 Encoder Block 的中间结果
+        #     "encoder": {
+        #         "block00": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         "block01": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         # ...
+        #     },
+        #
+        #     # 4. 所有 Encoder Block + 最终 LayerNorm 的输出
+        #     # pool_type == "tok" 时包含 CLS Token
+        #     "encoded": ...,  # Shape：[batch_size, seq_len, features]
+        # }
         encoded = out["encoded"] = x
 
+        # 根据 pool_type 选择不同的池化方式，将 Encoder 输出的多个 Token 特征
+        # 聚合或选取为一个代表整张图像的全局特征向量（pool_type="none" 除外）
+        #
+        # 输入 x：经过所有 Encoder Block + 最终 LayerNorm 的输出
+        # Shape：[batch_size, seq_len, features]
+        #
+        # seq_len：
+        #   pool_type == "tok"：1 + patch_rows * patch_cols
+        #   其他情况：patch_rows * patch_cols
+        #
+        # 池化方式：
+        #   "map"：通过 Cross-Attention 聚合所有 Patch Tokens 的特征
+        #   "gap"：对所有 Patch Tokens 的特征求平均
+        #   "0"：提取第 0 个 Patch Token 的特征
+        #   "tok"：提取通过 Self-Attention 聚合图像信息的 CLS Token
+        #   "none"：不进行池化，保留所有 Patch Tokens 的特征
+        #
+        # 输出 x：
+        #   pool_type != "none"：[batch_size, features]
+        #   pool_type == "none"：[batch_size, seq_len, features]
+
+
+        # 1. "map"：Multihead Attention Pooling（多头注意力池化）
+        # 使用可学习的 Probe Token，通过 Cross-Attention 聚合所有 Patch Tokens 的特征
         if self.pool_type == "map":
+
+            # MAPHead：
+            #   num_heads：Attention Head 的数量
+            #   mlp_dim：MLP 中间隐藏层的特征维度
+            #   dtype_mm：矩阵运算使用的数据类型
+            #
+            # 输入 x：[batch_size, patch_rows * patch_cols, features]
+            # 输出 x = out["head_input"]：[batch_size, features]
             x = out["head_input"] = MAPHead(
                 num_heads=self.num_heads,
                 mlp_dim=self.mlp_dim,
-                dtype=self.dtype_mm,
+                dtype_mm=self.dtype_mm,
             )(x)
+
+
+        # 2. "gap"：Global Average Pooling（全局平均池化）
         elif self.pool_type == "gap":
+
+            # axis=1：沿 seq_len 维度，对每张图像的所有 Patch Tokens
+            #         在每个 features 维度上分别求平均，得到全局特征向量
+            #
+            # 输入 x：[batch_size, patch_rows * patch_cols, features]
+            # 输出 x = out["head_input"]：[batch_size, features]
             x = out["head_input"] = jnp.mean(x, axis=1)
+
+
+        # 3. "0"：提取第 0 个 Patch Token 的特征，作为整张图像的全局特征
         elif self.pool_type == "0":
+
+            # x[:, 0]：保留所有 batch_size，提取 seq_len 维度中索引为 0 的 Token
+            #
+            # 输入 x：[batch_size, patch_rows * patch_cols, features]
+            # 输出 x = out["head_input"]：[batch_size, features]
+            #
+            # 注意：该 Token 经过多层 Self-Attention，已经与其他 Patch Tokens 交互信息
             x = out["head_input"] = x[:, 0]
+
+
+        # 4. "tok"：提取 CLS Token 作为整张图像的全局特征
         elif self.pool_type == "tok":
+
+            # CLS Token：经过多层 Encoder，通过 Self-Attention 聚合 Patch Tokens 的信息
+            # x[:, 0]：提取每张图像的 CLS Token
+            #
+            # 输入 x：[batch_size, 1 + patch_rows * patch_cols, features]
+            # 输出 x = out["head_input"]：[batch_size, features]
             x = out["head_input"] = x[:, 0]
+
+            # encoded[:, 1:]：剔除 CLS Token，只保留经过 Encoder 的 Patch Tokens
+            #
+            # 输入 encoded：[batch_size, 1 + patch_rows * patch_cols, features]
+            # 输出 encoded：[batch_size, patch_rows * patch_cols, features]
+            #
+            # 注意：只修改局部变量 encoded，不改变之前保存的 out["encoded"]
             encoded = encoded[:, 1:]
+
+
+        # 5. "none"：不进行池化，保留所有 Patch Tokens 的特征
         elif self.pool_type == "none":
+
+            # pass：不执行任何操作，x 保持不变
+            # 输入/输出 x：[batch_size, patch_rows * patch_cols, features]
+            # 此分支不会创建 out["head_input"]
             pass
+
+
+        # 6. 不支持的池化方式
         else:
+
+            # raise ValueError：抛出参数值错误异常，并显示当前 pool_type
             raise ValueError(f"Unknown pool type: '{self.pool_type}'")
 
+        # out：保存 ViT 各阶段中间结果的字典
+        #
+        # seq_len：
+        #   pool_type == "tok"：1 + patch_rows * patch_cols
+        #   pool_type != "tok"：patch_rows * patch_cols
+        #
+        # output_features：
+        #   self.rep_size 为 False：features
+        #   self.rep_size 为 True：features（rep_size = self.width）
+        #   self.rep_size 为正整数：rep_size
+        #
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        #
+        #     # 3. 各层 Encoder Block 的中间结果
+        #     "encoder": {
+        #         "block00": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         "block01": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         # ...
+        #     },
+        #
+        #     # 4. 所有 Encoder Block + 最终 LayerNorm 的输出
+        #     # pool_type == "tok" 时包含 CLS Token
+        #     "encoded": ...,  # Shape：[batch_size, seq_len, features]
+        #
+        #     # 5. 池化后的全局特征向量（仅 pool_type != "none" 时存在）
+        #     # "map"：Multihead Attention Pooling
+        #     # "gap"：Global Average Pooling
+        #     # "0"：第 0 个 Patch Token
+        #     # "tok"：CLS Token
+        #     "head_input": ...,  # Shape：[batch_size, features]
+        # }
+
+        # jnp.reshape()：将一维 Patch Token 序列恢复为二维 Patch 特征图
+        #
+        # encoded：经过所有 Encoder Block + 最终 LayerNorm 的 Patch Token 特征
+        # n = batch_size：图像数量
+        # h = patch_rows：Patch 特征图的行数
+        # w = patch_cols：Patch 特征图的列数
+        # -1：由 JAX 自动推断最后一维，即 features
+        #
+        # 输入 encoded：[batch_size, patch_rows * patch_cols, features]
+        # 输出 x_2d：[batch_size, patch_rows, patch_cols, features]
+        # 例如：[2, 196, 768] → [2, 14, 14, 768]
+        #
+        # 作用：恢复 Patch Tokens 的二维空间排列，不改变特征值
         x_2d = jnp.reshape(encoded, [n, h, w, -1])
 
+
+        # rep_size：Representation Size（表示层的输出特征维度）
+        # 1. int：指定表示层输出维度，例如 rep_size=512
+        #    非零整数在 if 判断中视为 True，因此会创建表示层
+        # 2. bool：
+        #    1) True：创建输出维度为 self.width 的表示层
+        #    2) False（默认）：不创建额外的表示层
         if self.rep_size:
+
+            # 确定表示层的输出特征维度
+            # 1. self.rep_size is True：rep_size = self.width（即 features）
+            # 2. self.rep_size 为非零 int：rep_size = self.rep_size
+            #
+            # 注意：is True 严格判断布尔对象 True，不会将整数 1 当作 True
             rep_size = self.width if self.rep_size is True else self.rep_size
-            hid = nn.Dense(rep_size, dtype=self.dtype_mm, name="pre_logits")
-            # NOTE: In the past we did not include tanh in pre_logits.
-            # For few-shot, it should not matter much, as it whitens anyways.
+
+            # nn.Dense()：创建全连接层（Fully Connected Layer）
+            #
+            # rep_size：全连接层的输出特征维度
+            # dtype：矩阵运算使用的数据类型
+            # name="pre_logits"：全连接层的名称
+            #
+            # 输入最后一维：features
+            # 权重 kernel：[features, rep_size]
+            # 偏置 bias：[rep_size]
+            # 输出最后一维：rep_size
+            #
+            # hid：全连接层模块，x_2d 和 x 共用同一组权重与偏置
+            hid = nn.Dense(
+                rep_size,
+                dtype=self.dtype_mm,
+                name="pre_logits",
+            )
+
+            # nn.tanh()：双曲正切激活函数（Hyperbolic Tangent）
+            # 对 Dense 输出的每个元素进行非线性变换，数值范围为 (-1, 1)
+            # 不改变张量 Shape
+            #
+            # x_2d → Dense → tanh
+            # 输入 x_2d：[batch_size, patch_rows, patch_cols, features]
+            # 输出 x_2d：[batch_size, patch_rows, patch_cols, rep_size]
+            #
+            # 作用：对每个 Patch 的特征向量进行相同的特征映射
             x_2d = nn.tanh(hid(x_2d))
+
+            # x → Dense → tanh
+            #
+            # 输入 x：
+            #   pool_type != "none"：[batch_size, features]
+            #   pool_type == "none"：[batch_size, seq_len, features]
+            #
+            # 输出 x：
+            #   pool_type != "none"：[batch_size, rep_size]
+            #   pool_type == "none"：[batch_size, seq_len, rep_size]
+            #
+            # 作用：将最后一维 features 映射为 rep_size
+            # 注意：与 x_2d 使用同一个 hid，因此共享权重和偏置
             x = nn.tanh(hid(x))
 
+
+        # out：保存 ViT 各阶段中间结果的字典
+        #
+        # seq_len：
+        #   pool_type == "tok"：1 + patch_rows * patch_cols
+        #   pool_type != "tok"：patch_rows * patch_cols
+        #
+        # output_features：
+        #   self.rep_size 为 False：features
+        #   self.rep_size 为 True：features（rep_size = self.width）
+        #   self.rep_size 为正整数：rep_size
+        #
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        #
+        #     # 3. 各层 Encoder Block 的中间结果
+        #     "encoder": {
+        #         "block00": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         "block01": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         # ...
+        #     },
+        #
+        #     # 4. 所有 Encoder Block + 最终 LayerNorm 的输出
+        #     # pool_type == "tok" 时包含 CLS Token
+        #     "encoded": ...,  # Shape：[batch_size, seq_len, features]
+        #
+        #     # 5. 池化后的全局特征向量（仅 pool_type != "none" 时存在）
+        #     # "map"：Multihead Attention Pooling
+        #     # "gap"：Global Average Pooling
+        #     # "0"：第 0 个 Patch Token
+        #     # "tok"：CLS Token
+        #     "head_input": ...,  # Shape：[batch_size, features]
+        #
+        #     # 6. Patch Tokens 的二维特征图（经过可选 Representation Layer）
+        #     # 不进行池化，保留每个 Patch 的空间位置和特征
+        #     "pre_logits_2d": ...,  # Shape：[batch_size, patch_rows, patch_cols, output_features]
+        #
+        #     # 7. 池化及可选 Representation Layer 处理后的特征
+        #     # pool_type != "none"：[batch_size, output_features]
+        #     # pool_type == "none"：[batch_size, seq_len, output_features]
+        #     "pre_logits": ...,
+        # }
+
+        # 保存 Representation Layer 处理后的二维 Patch 特征图
+        #
+        # self.rep_size 为 False：
+        #   out["pre_logits_2d"]：[batch_size, patch_rows, patch_cols, features]
+        #
+        # self.rep_size 为 True 或非零 int：
+        #   out["pre_logits_2d"]：[batch_size, patch_rows, patch_cols, rep_size]
         out["pre_logits_2d"] = x_2d
+        #
+        # 保存池化及可选 Representation Layer 处理后的特征
+        #
+        # pool_type != "none"：
+        #   self.rep_size 为 False：[batch_size, features]
+        #   self.rep_size 为 True 或非零 int：[batch_size, rep_size]
+        #
+        # pool_type == "none"：
+        #   self.rep_size 为 False：[batch_size, seq_len, features]
+        #   self.rep_size 为 True 或非零 int：[batch_size, seq_len, rep_size]
         out["pre_logits"] = x
 
+        # num_classes：分类类别数量（Number of Classes）
+        # 将输入特征的最后一维（features 或 rep_size）映射为 num_classes，
+        # 得到每个类别对应的原始分类分数（Logits）
+        #
+        # 1. self.rep_size 为 False：features → num_classes
+        # 2. self.rep_size 为 True：features → num_classes
+        # 3. self.rep_size 为正整数：rep_size → num_classes
+        #
+        # self.num_classes 为正整数时，创建分类层
+        # self.num_classes 为 None 或 0 时，不创建分类层
         if self.num_classes:
+
+            # head_zeroinit：是否将分类层（Classification Head）的权重初始化为全 0
+            # 1. True：kw = {"kernel_init": nn.initializers.zeros}
+            #    kernel_init：权重初始化函数，使用 zeros 将权重初始化为全 0
+            # 2. False：kw = {}，使用 nn.Dense 默认的权重初始化方式
+            #
+            # kw：Keyword Arguments（关键字参数）字典
             kw = {"kernel_init": nn.initializers.zeros} if self.head_zeroinit else {}
-            head = nn.Dense(self.num_classes, dtype=self.dtype_mm, name="head", **kw)
+
+            # nn.Dense()：创建分类层（Classification Head），将输入特征映射为分类分数（Logits）
+            #
+            # self.num_classes：分类类别数量，即输出特征维度
+            # dtype=self.dtype_mm：矩阵运算使用的数据类型
+            # name="head"：分类层的名称
+            # **kw：将 kw 字典展开为关键字参数，控制权重初始化方式
+            #
+            # input_features：
+            #   self.rep_size 为 False：features
+            #   self.rep_size 为 True：self.width（即 features）
+            #   self.rep_size 为正整数：rep_size
+            #
+            # 输入最后一维：input_features
+            # 权重 kernel：[input_features, num_classes]
+            # 偏置 bias：[num_classes]，默认初始化为全 0
+            # 输出最后一维：num_classes
+            #
+            # head：分类层模块，x_2d 和 x 共用同一组权重与偏置
+            head = nn.Dense(
+                self.num_classes,
+                dtype=self.dtype_mm,
+                name="head",
+                **kw,
+            )
+
+            # out：保存 ViT 各阶段中间结果的字典
+            #
+            # seq_len：
+            #   pool_type == "tok"：1 + patch_rows * patch_cols
+            #   pool_type != "tok"：patch_rows * patch_cols
+            #
+            # output_features：
+            #   self.rep_size 为 False：features
+            #   self.rep_size 为 True：features（rep_size = self.width）
+            #   self.rep_size 为正整数：rep_size
+            #
+            # out = {
+            #     # 1. Patch Embedding：卷积提取的 Patch 特征
+            #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+            #
+            #     # 2. Patch Tokens + Positional Embedding（此时尚未添加 CLS Token）
+            #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+            #
+            #     # 3. 各层 Encoder Block 的中间结果
+            #     "encoder": {
+            #         "block00": {
+            #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+            #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+            #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+            #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+            #         },
+            #         "block01": {
+            #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+            #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+            #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+            #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+            #         },
+            #         # ...
+            #     },
+            #
+            #     # 4. 所有 Encoder Block + 最终 LayerNorm 的输出
+            #     # pool_type == "tok" 时包含 CLS Token
+            #     "encoded": ...,  # Shape：[batch_size, seq_len, features]
+            #
+            #     # 5. 池化后的全局特征向量（仅 pool_type != "none" 时存在）
+            #     # "map"：Multihead Attention Pooling
+            #     # "gap"：Global Average Pooling
+            #     # "0"：第 0 个 Patch Token
+            #     # "tok"：CLS Token
+            #     "head_input": ...,  # Shape：[batch_size, features]
+            #
+            #     # 6. Patch Tokens 的二维特征图（经过可选 Representation Layer）
+            #     # 不进行池化，保留每个 Patch 的空间位置和特征
+            #     "pre_logits_2d": ...,  # Shape：[batch_size, patch_rows, patch_cols, output_features]
+            #
+            #     # 7. 池化及可选 Representation Layer 处理后的特征
+            #     # pool_type != "none"：[batch_size, output_features]
+            #     # pool_type == "none"：[batch_size, seq_len, output_features]
+            #     "pre_logits": ...,
+            #
+            #     # 8. 每个 Patch 的分类分数（仅 num_classes 非零时存在）
+            #     # 使用 Classification Head 将 output_features 映射为 num_classes
+            #     # 每个 Patch 对应 num_classes 个原始分类分数（未经 Softmax）
+            #     "logits_2d": ...,  # Shape：[batch_size, patch_rows, patch_cols, num_classes]
+            #
+            #     # 9. 分类层输出的原始分类分数（仅 num_classes 非零时存在）
+            #     # pool_type != "none"：[batch_size, num_classes]
+            #     # pool_type == "none"：[batch_size, seq_len, num_classes]
+            #     # 注意：与 logits_2d 使用同一个 Classification Head，共享权重和偏置
+            #     "logits": ...,  # Shape：[batch_size, num_classes] 或 [batch_size, seq_len, num_classes]
+            # }
+
+            # 对每个 Patch 的特征向量进行分类映射
+            # x_2d → head
+            #
+            # 输入 x_2d：[batch_size, patch_rows, patch_cols, input_features]
+            # 输出 x_2d：[batch_size, patch_rows, patch_cols, num_classes]
+            #
+            # out["logits_2d"]：保存每个 Patch 对应的 num_classes 个原始分类分数
+            # 注意：没有经过 Softmax，因此不是分类概率
             x_2d = out["logits_2d"] = head(x_2d)
+
+            # 对池化后的全局特征向量进行分类映射（pool_type="none" 除外）
+            # x → head
+            #
+            # 输入 x：
+            #   pool_type != "none"：[batch_size, input_features]
+            #   pool_type == "none"：[batch_size, seq_len, input_features]
+            #
+            # 输出 x：
+            #   pool_type != "none"：[batch_size, num_classes]
+            #   pool_type == "none"：[batch_size, seq_len, num_classes]
+            #
+            # out["logits"]：保存分类层输出的原始分类分数（Logits）
+            # 注意：与 x_2d 使用同一个 head，共享权重和偏置
             x = out["logits"] = head(x)
 
+        # return x, out：返回 ViT 的最终输出和各阶段中间结果
+        #
+        # 1. x：ViT 的最终输出
+        #
+        #    当 self.num_classes 为正整数时：
+        #      pool_type != "none"：[batch_size, num_classes]
+        #      pool_type == "none"：[batch_size, seq_len, num_classes]
+        #
+        #    当 self.num_classes 为 None 或 0 时：
+        #      pool_type != "none"：[batch_size, output_features]
+        #      pool_type == "none"：[batch_size, seq_len, output_features]
+        #
+        # 2. out：保存 ViT 各阶段中间结果的字典（dict）
+        #
+        # seq_len：
+        #   pool_type == "tok"：1 + patch_rows * patch_cols
+        #   pool_type != "tok"：patch_rows * patch_cols
+        #
+        # output_features：
+        #   self.rep_size 为 False：features
+        #   self.rep_size 为 True：features（self.width）
+        #   self.rep_size 为正整数：rep_size
+        #
+        # out = {
+        #     # 1. Patch Embedding：卷积提取的 Patch 特征
+        #     "stem": ...,  # Shape：[batch_size, patch_rows, patch_cols, features]
+        #
+        #     # 2. Patch Tokens + Positional Embedding（尚未添加 CLS Token）
+        #     "with_posemb": ...,  # Shape：[batch_size, patch_rows * patch_cols, features]
+        #
+        #     # 3. 各层 Encoder Block 的中间结果
+        #     "encoder": {
+        #         "block00": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         "block01": {
+        #             "sa":   ...,  # Shape：[batch_size, seq_len, features]
+        #             "+sa":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "mlp":  ...,  # Shape：[batch_size, seq_len, features]
+        #             "+mlp": ...,  # Shape：[batch_size, seq_len, features]
+        #         },
+        #         # ...
+        #     },
+        #
+        #     # 4. 所有 Encoder Block + 最终 LayerNorm 的输出
+        #     # pool_type == "tok" 时包含 CLS Token
+        #     "encoded": ...,  # Shape：[batch_size, seq_len, features]
+        #
+        #     # 5. 池化后的全局特征向量（仅 pool_type != "none" 时存在）
+        #     # "map"：Multihead Attention Pooling
+        #     # "gap"：Global Average Pooling
+        #     # "0"：第 0 个 Patch Token
+        #     # "tok"：CLS Token
+        #     "head_input": ...,  # Shape：[batch_size, features]
+        #
+        #     # 6. Patch Tokens 的二维特征图（经过可选 Representation Layer）
+        #     # 不进行池化，保留每个 Patch 的空间位置和特征
+        #     "pre_logits_2d": ...,  # Shape：[batch_size, patch_rows, patch_cols, output_features]
+        #
+        #     # 7. 池化及可选 Representation Layer 处理后的特征
+        #     # pool_type != "none"：[batch_size, output_features]
+        #     # pool_type == "none"：[batch_size, seq_len, output_features]
+        #     "pre_logits": ...,  # Shape：[batch_size, output_features] 或 [batch_size, seq_len, output_features]
+        #
+        #     # 8. 每个 Patch 的分类分数（仅 self.num_classes 为正整数时存在）
+        #     # 使用 Classification Head 将 output_features 映射为 num_classes
+        #     # 每个 Patch 对应 num_classes 个原始分类分数（未经 Softmax）
+        #     "logits_2d": ...,  # Shape：[batch_size, patch_rows, patch_cols, num_classes]
+        #
+        #     # 9. 最终分类分数（仅 self.num_classes 为正整数时存在）
+        #     # pool_type != "none"：[batch_size, num_classes]
+        #     # pool_type == "none"：[batch_size, seq_len, num_classes]
+        #     "logits": ...,  # Shape：[batch_size, num_classes] 或 [batch_size, seq_len, num_classes]
+        # }
+        #
+        # 注意：
+        # 1. pool_type == "none" 时，out 中不存在 "head_input"
+        # 2. self.num_classes 为 None 或 0 时，out 中不存在 "logits_2d" 和 "logits"
+        # 3. pool_type == "tok" 时，out["encoded"] 包含 CLS Token，
+        #    但 out["pre_logits_2d"] 和 out["logits_2d"] 只包含 Patch Tokens
+        # 4. self.num_classes 为正整数时：x = out["logits"]
+        #    否则：x = out["pre_logits"]
+        # 5. out 是字典，本身没有 Shape，只有其中的张量具有 Shape
         return x, out
 
+# Module()：ViT 模型的工厂函数（Factory Function）
+# 根据 variant 解析模型配置，并创建 _Module 实例
+#
+# 参数：
+#
+# 返回：
+# _Module 实例（ViT 模型），不是模型的前向计算结果
+def Module(
+    # num_classes：分类类别数量，默认为 None（不创建分类层）
+    num_classes=None, 
+    # *：表示后面的参数只能通过关键字传递
+    *, 
+    # variant：ViT 模型变体名称，默认为 None，通过 decode_variant() 解析为模型配置字典
+    variant=None, 
+    # **kw：Keyword Arguments（额外的关键字参数），用于指定或覆盖模型配置，例如 width、depth、num_heads 等
+    **kw
+):
 
-def Module(num_classes=None, *, variant=None, **kw):  # pylint: disable=invalid-name  # noqa: N802
-    """Factory function, because linen really don't like what I'm doing!"""
+    # decode_variant(variant)：将模型变体名称解析为配置字典
+    # 例如：{"width": 768, "depth": 12, "num_heads": 12, ...}
+    #
+    # {**decode_variant(variant), **kw}：合并两个配置字典
+    # 1. **decode_variant(variant)：展开模型变体的默认配置
+    # 2. **kw：展开用户额外传入的配置
+    # 3. 如果两个字典存在相同的键，以 **kw 中的值为准
+    #
+    # _Module(num_classes, **...)：创建 ViT 模型实例
+    # num_classes：作为第一个位置参数传入 _Module
+    # **：将合并后的配置字典展开为关键字参数
     return _Module(num_classes, **{**decode_variant(variant), **kw})
 
 
+# decode_variant()：解析 ViT 模型变体名称（Model Variant）
+# 将字符串形式的模型配置转换为字典（dict）
+#
+# 参数：
+# variant：ViT 模型变体名称，类型为 str 或 None
+#   1. None：不指定模型变体，返回空字典 {}
+#   2. "B"：只指定模型规模，使用 _Module 中默认的 patch_size
+#   3. "B/16"：指定模型规模为 B，Patch 大小为 (16, 16)
+#   4. "L/32"：指定模型规模为 L，Patch 大小为 (32, 32)
+#
+# 返回：
+# dict：包含 width、depth、mlp_dim、num_heads 等模型配置
+# 如果 variant 包含 "/数字"，还会包含 patch_size
 def decode_variant(variant):
-    """Converts a string like "B" or "B/32" into a params dict."""
+
+    # variant is None：未指定模型变体，返回空字典
+    # 后续由 _Module 使用自身的默认配置，或由用户通过 **kw 指定
     if variant is None:
         return {}
 
+    # v：模型规模名称（Variant），初始值为 variant
+    # patch：Patch 配置字典，初始为空字典 {}
+    #
+    # 例如 variant="B/16"：
+    #   v = "B/16"
+    #   patch = {}
     v, patch = variant, {}
+
+    # "/" in variant：判断模型名称中是否包含 "/"
+    # 1. True：同时指定模型规模和 Patch 大小，例如 "B/16"
+    # 2. False：只指定模型规模，例如 "B"
     if "/" in variant:
+
+        # str.split("/")：按照 "/" 分割字符串
+        #
+        # 例如：
+        #   variant = "B/16"
+        #   variant.split("/") = ["B", "16"]
+        #
+        #   v = "B"       # 模型规模
+        #   patch = "16"  # Patch 大小，当前类型为 str
         v, patch = variant.split("/")
+
+        # int(patch)：将 Patch 大小由字符串转换为整数
+        # (int(patch), int(patch))：构造二维 Patch 大小
+        #
+        # 例如：
+        #   patch = "16"
+        #   int(patch) = 16
+        #   patch = {"patch_size": (16, 16)}
+        #
+        # patch_size：[patch_height, patch_width]
+        # 表示每个 Patch 包含 16 × 16 个像素（以 "B/16" 为例）
         patch = {"patch_size": (int(patch), int(patch))}
 
+    # 根据 v 查找对应的 ViT 模型配置，并返回字典
+    #
+    # v：模型规模名称，例如 "B"、"L"、"H"
+    #
+    # 字典索引 [v]：
+    #   从配置字典中获取键 v 对应的数值
+    #
+    # 例如：
+    #   {"B": 768, "L": 1024}["B"] = 768
+    #
+    # 如果 v 不存在于配置字典中，则抛出 KeyError
     return {
-        # pylint:disable=line-too-long
-        # Reference: Table 2 of https://arxiv.org/abs/2106.04560.
+
+        # 1. width：Transformer 隐藏层的特征维度
+        #    即每个 Token 的特征维度（Embedding Dimension）
+        #
+        #    Encoder 输入/输出：[batch_size, seq_len, width]
+        #
+        #    例如：
+        #      v="B" → width=768
+        #      v="L" → width=1024
         "width": {
             "mu": 32,
             "Ti": 192,
@@ -1339,6 +2041,12 @@ def decode_variant(variant):
             "G-opt": 1536,
             "e": 1792,
         }[v],
+
+        # 2. depth：Transformer Encoder Block 的层数
+        #
+        #    例如：
+        #      v="B" → depth=12，即包含 12 个 Encoder Block
+        #      v="L" → depth=24，即包含 24 个 Encoder Block
         "depth": {
             "mu": 1,
             "Ti": 12,
@@ -1354,6 +2062,17 @@ def decode_variant(variant):
             "G-opt": 48,
             "e": 56,
         }[v],
+
+        # 3. mlp_dim：Encoder Block 中 MLP 的中间隐藏层维度
+        #
+        #    MLP 的特征维度变化：
+        #      [batch_size, seq_len, width]
+        #      → [batch_size, seq_len, mlp_dim]
+        #      → [batch_size, seq_len, width]
+        #
+        #    例如：
+        #      v="B" → width=768，mlp_dim=3072
+        #      v="L" → width=1024，mlp_dim=4096
         "mlp_dim": {
             "mu": 128,
             "Ti": 768,
@@ -1369,6 +2088,18 @@ def decode_variant(variant):
             "G-opt": 8192,
             "e": 15360,
         }[v],
+
+        # 4. num_heads：Multi-Head Self-Attention 中 Query Head 的数量
+        #
+        #    head_dim = width // num_heads
+        #    前提：width 可以被 num_heads 整除
+        #
+        #    Q、K、V 分头后的典型 Shape：
+        #      [batch_size, seq_len, num_heads, head_dim]
+        #
+        #    例如：
+        #      v="B" → width=768，num_heads=12，head_dim=64
+        #      v="L" → width=1024，num_heads=16，head_dim=64
         "num_heads": {
             "mu": 2,
             "Ti": 3,
@@ -1384,6 +2115,20 @@ def decode_variant(variant):
             "G-opt": 16,
             "e": 16,
         }[v],
+
         # pylint:enable=line-too-long
+        # 恢复 Pylint 对代码行长度的检查
+
+        # 5. **patch：将 Patch 配置字典展开并合并到返回字典中
+        #
+        # 1. variant="B"：
+        #    patch = {}
+        #    不添加 patch_size，使用 _Module 的默认值
+        #
+        # 2. variant="B/16"：
+        #    patch = {"patch_size": (16, 16)}
+        #    返回字典中额外包含 "patch_size": (16, 16)
+        #
+        # **：Dictionary Unpacking（字典解包）
         **patch,
     }
