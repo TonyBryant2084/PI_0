@@ -1127,6 +1127,20 @@ class MAPHead(nn.Module):
         # x[:, 0]：[batch_size, 1, features] → [batch_size, features]
         return x[:, 0]
 
+    # Eg：
+    # {**decode_variant(variant), **kw} = {
+    #     "patch_size": (14, 14),  # 每个图像 Patch 的大小
+    #     "width": 1152,           # Transformer 隐藏层维度
+    #     "depth": 27,             # Transformer Block 层数
+    #     "mlp_dim": 4304,         # MLP 中间隐藏层维度
+    #     "num_heads": 16,         # Attention Head 数量
+    #     "pool_type": "none",     # 不进行池化，保留所有 Patch Token
+    #     "scan": True,            # 使用 nn.scan 构建 Transformer Encoder
+    #     "dtype_mm": "bfloat16",  # 矩阵运算的数据类型
+    # }
+    # 将 {**decode_variant(variant), **kw} 用 ** 解包作为参数传入
+    # return _Module(num_classes, **{**decode_variant(variant), **kw})
+
 # Vision Transformer 模型
 class _Module(nn.Module):
 
@@ -1928,7 +1942,7 @@ class _Module(nn.Module):
 def Module(
     # num_classes：分类类别数量，默认为 None（不创建分类层）
     num_classes=None, 
-    # *：表示后面的参数只能通过关键字传递
+    # *：只限制它后面显式声明的普通形参，使这些参数必须通过关键字传递；对 **kw 接收额外关键字参数，以及字典解包传参的行为没有影响
     *, 
     # variant：ViT 模型变体名称，默认为 None，通过 decode_variant() 解析为模型配置字典
     variant=None, 
@@ -1947,8 +1961,20 @@ def Module(
     # _Module(num_classes, **...)：创建 ViT 模型实例
     # num_classes：作为第一个位置参数传入 _Module
     # **：将合并后的配置字典展开为关键字参数
-    return _Module(num_classes, **{**decode_variant(variant), **kw})
 
+    # Eg：
+    # {**decode_variant(variant), **kw} = {
+    #     "width": 1152,           # Transformer 隐藏层维度
+    #     "depth": 27,             # Transformer Block 层数
+    #     "mlp_dim": 4304,         # MLP 中间隐藏层维度
+    #     "num_heads": 16,         # Attention Head 数量
+    #     "patch_size": (14, 14),  # 每个图像 Patch 的大小
+    #     "pool_type": "none",     # 不进行池化，保留所有 Patch Token
+    #     "scan": True,            # 使用 nn.scan 构建 Transformer Encoder
+    #     "dtype_mm": "bfloat16",  # 矩阵运算的数据类型
+    # }
+    # 将 {**decode_variant(variant), **kw} 用 ** 解包作为参数传入
+    return _Module(num_classes, **{**decode_variant(variant), **kw})
 
 # decode_variant()：解析 ViT 模型变体名称（Model Variant）
 # 将字符串形式的模型配置转换为字典（dict）

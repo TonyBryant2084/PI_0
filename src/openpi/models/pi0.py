@@ -69,7 +69,11 @@ class Pi0(_model.BaseModel):
         self, 
         # PI0 配置参数
         config: pi0_config.Pi0Config, 
-        # 根据 JAX 的随机数密钥 rng，创建的用于管理随机数密钥的对象 rngs（nnx.Rngs），供后续模型初始化等操作使用
+        # 随机数密钥（Random Key）：用于控制随机数的生成，使随机操作具有可复现性
+        #
+        # 随机数密钥管理器（Random Key Manager）：用于管理不同用途的随机数密钥，并按需生成新的随机数密钥
+        #
+        # 根据 JAX 的随机数密钥 rng，随机数密钥管理器 rngs（nnx.Rngs），用于管理不同用途的随机数密钥，并按需生成新的随机数密钥
         rngs: nnx.Rngs
     ):
 
@@ -150,6 +154,12 @@ class Pi0(_model.BaseModel):
             _siglip.Module(
                 num_classes=paligemma_config.width,
                 variant="So400m/14",
+                # 以下参数被当成字典进行传入
+                # kw = {
+                #     "pool_type": "none",
+                #     "scan": True,
+                #     "dtype_mm": "bfloat16",
+                # }
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
@@ -157,6 +167,7 @@ class Pi0(_model.BaseModel):
         )
 
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+        
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:

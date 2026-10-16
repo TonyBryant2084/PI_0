@@ -1266,22 +1266,20 @@ class Module(nn.Module):
         # 返回的 embedded 和 kv_cache 不需要使用。
         self(
             # embedded = [
-            #   Expert_1：[batch_size=1, seq_len_expert=1, width_1],
-            #   Expert_2：[batch_size=1, seq_len_expert=1, width_2],
-            #   ...
+            #   Expert_1：[batch_size=1, seq_len_expert=1, width=2048,
+            #   Expert_2：[batch_size=1, seq_len_expert=1, width=1024],
             # ]
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
 
-            # positions：[batch_size=1, seq_len_sum=num_experts]
+            # positions：[batch_size=1, seq_len_sum=2]
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
 
-            # mask：[batch_size=1, query_len=num_experts, key_len=num_experts]
+            # mask：[batch_size=1, query_len=2, key_len=2]
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
 
             # adarms_cond = [
-            #   Expert_1：[batch_size=1, cond_dim=width_1] 或 None,
-            #   Expert_2：[batch_size=1, cond_dim=width_2] 或 None,
-            #   ...
+            #   Expert_1：None,
+            #   Expert_2：None,
             # ]
             # use_adarms：每个 Expert 是否使用 AdaRMSNorm 条件输入。
             # u=True：创建对应 Expert 的全零条件张量。
