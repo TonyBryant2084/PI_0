@@ -1063,11 +1063,37 @@ class Module(nn.Module):
         self.layers = nn.scan(
             # 已经经过 nn.remat 包装的 Transformer Block
             block_cls,
-            # 将所有 Transformer Block 的参数沿第 0 维（depth）堆叠
-            # 每个 Transformer Block 拥有独立的可学习参数
-            # nn.scan 执行时，每一层使用对应的参数
+
+            # variable_axes：指定 Flax 变量集合沿哪个轴组织
+            # "params"：Flax 中存放可训练参数的变量集合
+            # 0：将参数张量的第 0 维作为 Scan 的循环维度
+            #
+            # 例如：
+            # 单层 Dense 权重：[768, 3072]
+            # depth=12 时：[12, 768, 3072]
+            #
+            # 第 1 层使用 params[0]
+            # 第 2 层使用 params[1]
+            # ...
+            # 第 12 层使用 params[11]
+            #
+            # 每层使用独立的参数，不共享权重
             variable_axes={"params": 0},
-            # 指定随机数生成器是否在不同扫描层之间拆分
+
+
+            # split_rngs：控制是否沿 Scan 迭代为每层拆分独立随机密钥
+            # RNG = Random Number Generator（随机数生成器）
+            #
+            # 1. "params"：控制模型参数初始化使用的随机密钥
+            #    1) True：每层使用不同的参数初始化随机密钥
+            #    2) False：每层使用相同的参数初始化随机密钥
+            #
+            # 2. "dropout"：控制 Dropout 掩码采样使用的随机密钥
+            #    1) True：每层使用不同的 Dropout 随机密钥
+            #    2) False：每层使用相同的 Dropout 随机密钥
+            #
+            # 注意：
+            # split_rngs 控制随机密钥是否按层拆分，不控制权重是否共享
             split_rngs={
                 # 不同 Transformer Block 使用独立的参数初始化随机数
                 "params": True, 
