@@ -374,48 +374,146 @@ def preprocess_observation(
 # abc.ABC：Abstract Base Classes 抽象基类
 class BaseModelConfig(abc.ABC):
 
-    # Action space dimension.
+    # 动作维度
     action_dim: int
-    # Action sequence length.
+    # 动作序列长度
     action_horizon: int
-    # Tokenized prompt maximum length.
+    # 语言 token 最大长度
     max_token_len: int
 
+    # @property：将方法转换为属性，使其可以像访问成员变量一样访问，无需添加 ()
     @property
+    # @abc.abstractmethod：声明抽象方法，要求具体子类实现
     @abc.abstractmethod
-    def model_type(self) -> ModelType:
-        """The model type."""
-
+    # model_type：返回模型类型（ModelType）
+    def model_type(self) -> ModelType: ...
+        
+    # @abc.abstractmethod：声明抽象方法，要求具体子类实现
     @abc.abstractmethod
-    def create(self, rng: at.KeyArrayLike) -> "BaseModel":
-        """Create a new model, initializing parameters."""
+    # create：根据随机数密钥 rng 创建并返回 BaseModel 模型实例
+    def create(self, rng: at.KeyArrayLike) -> "BaseModel": ...
 
-    def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
-        """Create a model with the given parameters."""
+    # load：将已有模型参数 params 加载到模型中，并返回加载参数后的 BaseModel 实例
+    def load(
+        self, 
+        # 待加载的模型参数（Parameters），通常为 PyTree 结构
+        params: at.Params,
+        *, 
+        # 是否移除 params 中模型不需要的额外参数，默认 True
+        remove_extra_params: bool = True
+    ) -> "BaseModel":
+
+        # 创建抽象模型
+        # 通过模型创建函数 self.create 和随机数密钥 rng，抽象创建一个具有完整模型结构的抽象模型，其中权重参数只有 shape 和 dtype 信息，没有真实的数值数据
         model = nnx.eval_shape(self.create, jax.random.key(0))
+
+        # nnx.split：将模型拆分为模型结构和模型状态，支持普通模型和抽象模型
+        # graphdef：模型结构（Graph Definition），不包含真实参数数值
+        # state：模型状态（State），保存模型的权重等状态变量
+        #   1. 普通模型：包含真实权重数值及其 shape、dtype
+        #   2. 抽象模型：仅包含权重等变量的 shape、dtype，没有真实数值
         graphdef, state = nnx.split(model)
+
+        # 如果 remove_extra_params=True，则移除 params 中模型不需要的额外参数
         if remove_extra_params:
+            # 输入：
+            #   1. state.to_pure_dict()：将模型状态转换为普通字典形式的 PyTree，作为预期参数结构
+            #   2. params：待加载的真实模型参数
+            # ocp.transform_utils.intersect_trees：根据两个 PyTree 的共同路径，保留 params 中与 state 对应的参数
+            # 输出：params：筛选后的模型参数，移除了模型不需要的额外参数
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+
+        # at.check_pytree_equality：检查待加载参数与抽象模型的参数是否匹配
+        # 注意：同时也会检查 PyTree 的结构是否一致，不匹配时抛出异常
+        at.check_pytree_equality(
+            # expected：抽象模型的预期参数，包含 PyTree 结构及各参数的 shape、dtype
+            expected=state.to_pure_dict(), 
+            # got：待加载的真实模型参数 params
+            got=params, 
+            # check_shapes=True：检查对应参数的 shape 是否一致
+            check_shapes=True, 
+            # check_dtypes=False：不检查对应参数的 dtype 是否一致
+            check_dtypes=False
+        )
+   
+        # state.replace_by_pure_dict(params)：使用真实模型参数 params 替换 state 中的抽象参数
+        # state：替换后的模型状态，包含真实权重数值及其 shape、dtype
         state.replace_by_pure_dict(params)
+
+        # nnx.merge：将模型结构 graphdef 和真实模型状态 state 合并，重建完整模型
+        # 返回值：包含真实权重参数的 BaseModel 模型实例，可用于后续训练或推理
         return nnx.merge(graphdef, state)
 
-    def load_pytorch(self, train_config, weight_path: str):
+    # load_pytorch：根据训练配置创建 PyTorch 版本的 π0 模型，加载预训练权重并返回模型实例
+    def load_pytorch(
+        self, 
+        # 训练配置（Training Configuration），包含模型配置等信息
+        train_config, 
+        # 预训练权重文件路径（Weight Path）
+        weight_path: str
+    ):
+        # # logger.info：将训练配置信息输出到日志
         logger.info(f"train_config: {train_config}")
+
+        # PI0Pytorch：根据 train_config.model 创建 PyTorch 版本的 π0 模型
+        # 1. train_config.model：模型配置
+        # 2. model：包含真实的初始化权重（通常是随机初始化）的模型
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+
+        # safetensors.torch.load_model：从权重文件加载参数，并更新 model 中的模型权重
+        # model：需要加载权重的 PyTorch 模型实例
+        # weight_path：预训练权重文件路径
         safetensors.torch.load_model(model, weight_path)
+
+        # 返回包含预训练权重的模型实例
         return model
 
+    # @abc.abstractmethod：声明抽象方法，要求具体子类实现
     @abc.abstractmethod
-    def inputs_spec(self, *, batch_size: int = 1) -> tuple[Observation, Actions]:
-        """Returns the input specification for the model. Values are jax.ShapeDtypeStruct."""
+    # inputs_spec（Input Specification）：返回模型输入的抽象数据规格
+    # Observation 和 Actions 中的张量均由 jax.ShapeDtypeStruct 描述，仅包含 shape 和 dtype，没有真实数据
+    def inputs_spec(
+        self,
+        *,
+        # batch_size：批次大小（Batch Size），默认 1
+        batch_size: int = 1
+    ) -> tuple[Observation, Actions]: ...
 
-    def fake_obs(self, batch_size: int = 1) -> Observation:
+    # fake_obs（Fake Observation）：根据 Observation 的抽象数据规格，生成所有张量元素均为 1 的模拟观测数据
+    def fake_obs(
+        self,
+        # batch_size：批次大小（Batch Size），默认 1
+        batch_size: int = 1
+    ) -> Observation:
+
+        # inputs_spec：获取模型输入的抽象数据规格：Observation 和 Actions
+        # observation_spec：观测数据的抽象规格，包含 shape 和 dtype
+        # _：忽略 Actions 的抽象数据规格
         observation_spec, _ = self.inputs_spec(batch_size=batch_size)
+
+        # jax.tree.map：遍历 observation_spec 的所有叶子节点
+        # x：当前叶子节点的抽象规格 jax.ShapeDtypeStruct，包含 shape 和 dtype
+        # jnp.ones：根据 x.shape 和 x.dtype 创建元素全为 1 的真实张量
+        # 返回：与 observation_spec 结构相同、包含真实数据的 Observation
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), observation_spec)
 
-    def fake_act(self, batch_size: int = 1) -> Actions:
+
+    # fake_act（Fake Action）：根据 Actions 的抽象数据规格，生成所有张量元素均为 1 的模拟动作数据
+    def fake_act(
+        self,
+        # batch_size：批次大小（Batch Size），默认 1
+        batch_size: int = 1
+    ) -> Actions:
+
+        # inputs_spec：获取模型输入的抽象数据规格：Observation 和 Actions
+        # action_spec：动作数据的抽象规格，包含 shape 和 dtype
+        # _：忽略 Observation 的抽象数据规格
         _, action_spec = self.inputs_spec(batch_size=batch_size)
+
+        # jax.tree.map：遍历 action_spec 的所有叶子节点
+        # x：当前叶子节点的抽象规格 jax.ShapeDtypeStruct，包含 shape 和 dtype
+        # jnp.ones：根据 x.shape 和 x.dtype 创建元素全为 1 的真实张量
+        # 返回：与 action_spec 结构相同、包含真实数据的 Actions
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
 
 # @dataclasses.dataclass：
@@ -468,51 +566,119 @@ class BaseModel(nnx.Module, abc.ABC):
         **kwargs                   # 接收额外的关键字参数
     ) -> Actions: ...              # 返回模型生成的动作序列
 
-
+# Checkpoint（检查点）：训练过程中保存的模型参数及其他训练状态，用于恢复训练或模型推理
+# restore_params（Restore Parameters）：从 Checkpoint 中读取并恢复模型参数
 def restore_params(
+    # params_path：Checkpoint 所在目录的路径，支持 Path 对象或字符串
     params_path: pathlib.Path | str,
     *,
+    # restore_type：恢复后的参数数组类型（Array Type），默认 jax.Array，也可指定 np.ndarray
     restore_type: type[np.ndarray] | type[jax.Array] = jax.Array,
+    # dtype：恢复后的参数数据类型（Data Type），默认 None，保留 Checkpoint 中原始 dtype
     dtype: jnp.dtype | None = None,
+    # sharding：参数的设备分片策略（Sharding），默认 None，使用函数内部的默认策略
     sharding: jax.sharding.Sharding | None = None,
 ) -> at.Params:
-    """Restores unstructured params PyTree from a checkpoint.
 
-    This works with checkpoints saved with `save_state` during openpi training (see `training/checkpoints.py`) as
-    well as pre-trained checkpoints released for openpi.
-
-    Args:
-        params_path: The local path to the checkpoint directory.
-        restore_type: The type to restore the params as. Can be set to `np.ndarray` to load the params as a numpy array.
-        dtype: The dtype to restore all params as. If not provided, will use the original dtype from the checkpoint.
-        sharding: The sharding to use for the params. If not provided, the params will be replicated across all devices.
-
-    Returns:
-        The restored params.
-    """
+    # 处理 Checkpoint 路径：本地路径转换为绝对路径，GCS 云存储路径保持不变
+    # 1. params_path 不以 "gs://" 开头（本地路径）：
+    #    1. pathlib.Path(params_path)：将本地路径转换为 Path 路径对象
+    #    2. resolve()：将路径转换为绝对路径，同时解析符号链接
+    # 2. params_path 以 "gs://" 开头（Google Cloud Storage 云存储路径）：
+    #    保持原路径不变
     params_path = pathlib.Path(params_path).resolve() if not str(params_path).startswith("gs://") else params_path
 
+    # 如果恢复后的参数数组类型为 jax.Array，且未指定设备分片策略，则创建默认的设备分片策略
     if restore_type is jax.Array and sharding is None:
+
+        # 1. jax.devices()：获取当前 JAX 可以使用的所有计算设备
+        # 2. ("x",)：将设备网格的唯一维度命名为 "x"
+        # 3. jax.sharding.Mesh：将所有设备组织为一维设备网格
+        # 4. mesh：一维设备网格，shape=[设备数量]
         mesh = jax.sharding.Mesh(jax.devices(), ("x",))
+
+        # 1. mesh：设备网格（Device Mesh），指定参与参数存储的计算设备
+        # 2. jax.sharding.PartitionSpec()：空分片规则，表示参数不沿设备网格维度进行切分
+        # 3. jax.sharding.NamedSharding：将设备网格与分片规则关联，创建分片策略
+        # 4. sharding：参数在 mesh 的所有设备上复制，每个设备保存完整的参数数据
         sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # ocp.PyTreeCheckpointer：创建 Orbax Checkpoint 读取器，用于恢复 PyTree 结构的模型参数
+    # ckptr：Checkpoint 读取器
+    # with：使用结束后自动释放 Checkpointer 管理的资源
     with ocp.PyTreeCheckpointer() as ckptr:
+
+        # ckptr.metadata：读取 Checkpoint 的元数据（Metadata），不加载真实权重数值
+        # params_path：Checkpoint 所在目录
+        # metadata：Checkpoint 的元数据，包含参数结构、shape、dtype 等信息
         metadata = ckptr.metadata(params_path)
+
+        # metadata["params"]：获取模型参数对应的元数据 PyTree
+        # item：构建只包含 "params" 的字典，指定需要恢复的参数部分
         item = {"params": metadata["params"]}
 
+        # params：包含真实权重数值的模型参数 PyTree 
+        # ckptr.restore：从 Checkpoint 中恢复真实模型参数
         params = ckptr.restore(
+            # params_path：Checkpoint 所在目录
             params_path,
+            # ocp.args.PyTreeRestore：配置 PyTree 的恢复方式
             ocp.args.PyTreeRestore(
+                # item：指定需要恢复的参数结构
                 item=item,
+                # restore_args：为 PyTree 中的每个参数指定恢复配置
+                # jax.tree.map：遍历 item 中的所有叶子节点
+                # _：当前叶子节点的元数据，此处不使用其具体值
+                # ocp.ArrayRestoreArgs：为每个参数创建数组恢复配置
+                # sharding：指定参数恢复后的设备分片策略
+                # restore_type：指定参数恢复后的数组类型，例如 jax.Array
+                # dtype：指定参数恢复后的数据类型，None 表示保留原始 dtype
+                # 返回：与 item 具有相同 PyTree 结构的恢复配置
                 restore_args=jax.tree.map(
                     lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
                 ),
             ),
-        )["params"]
+        )["params"] # ["params"]：从恢复结果中提取模型参数
 
-    # If the params were saved with `save_state` during openpi training, every key path will end with "value", which is
-    # added by `nnx.State`. We remove the "value" suffix here and always return what NNX calls a "pure dict".
+
+    # traverse_util.flatten_dict：将嵌套的参数字典展平为以元组路径为键的字典
+    # params：从 Checkpoint 中恢复的真实模型参数 PyTree
+    # flat_params：展平后的参数字典
+    #
+    # 例如：
+    # params = {
+    #     "layer1": {
+    #         "kernel": {"value": 10},
+    #         "bias": {"value": 20}
+    #     }
+    # }
+    #
+    # flat_params = {
+    #     ("layer1", "kernel", "value"): 10,
+    #     ("layer1", "bias", "value"): 20
+    # }
     flat_params = traverse_util.flatten_dict(params)
+
+
     if all(kp[-1] == "value" for kp in flat_params):
+        # flat_params.items()：遍历参数字典中的键路径 kp 和对应的参数值 v
+        # kp[:-1]：移除键路径最后一个元素 "value"
+        # v：对应的真实模型参数数组，保持不变
+        # flat_params：移除所有参数路径末尾 "value" 后的新字典
+        #
+        # flat_params = {
+        #     ("layer1", "kernel"): 10,
+        #     ("layer1", "bias"): 20
+        # }
         flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
+
+    # traverse_util.unflatten_dict：将展平的参数字典重新转换为嵌套字典
+    # 返回：包含真实权重数值的纯参数字典（Pure Dict）
+    #
+    # {
+    #     "layer1": {
+    #         "kernel": 10,
+    #         "bias": 20
+    #     }
+    # }
     return traverse_util.unflatten_dict(flat_params)

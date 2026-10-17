@@ -8,7 +8,7 @@ def main():
     # Jax 当前版本 (JAX version: 0.5.3)
     print("JAX version:", jax.__version__)
 
-    # 识别运行设备 (Devices: [CudaDevice(id=0)])
+    # 获取 JAX 当前可用的所有设备，例如 CPU、GPU (Devices: [CudaDevice(id=0)])
     print("Devices:", jax.devices())
 
 # 2. 配置 Pi0 模型
