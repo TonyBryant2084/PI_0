@@ -208,44 +208,116 @@ class Pi0Config(_model.BaseModelConfig):
         # 返回模型输入的抽象数据规格
         return observation_spec, action_spec
 
+    # get_freeze_filter()：生成模型参数冻结过滤器
+    #
+    # 1. LoRA（Low-Rank Adaptation，低秩适配）的目标：
+    #    1. 冻结预训练模型的原始权重 W，不直接更新这些大规模参数
+    #    2. 引入少量可训练的低秩参数 A、B，通过 ΔW = BA 近似原始权重的更新
+    #    3. 前向计算使用 W + ΔW，而训练时只更新 A、B
+    #    4. 以少量可训练参数的更新，替代对大规模原始权重的直接更新
+    #    5. 减少可训练参数量、优化器状态占用和训练成本
+    #
+    # 2. 在 π0 中：
+    #    1. PaliGemma 中的 Gemma 可以使用 LoRA
+    #    2. Action Expert 中的 Gemma 也可以使用 LoRA
+    #    3. 哪部分使用 LoRA，就冻结该部分的原始权重，保留 LoRA 参数可训练
+    #    4. 哪部分不使用 LoRA，就不冻结该部分的原始权重
+    #
+    # 3. 本函数的作用：
+    #    根据 PaliGemma 和 Action Expert 的 LoRA 配置，生成模型参数路径过滤器
+    #    用于匹配需要冻结的原始模型参数，同时排除需要训练的 LoRA 参数，保证 LoRA 参数可以正常训练
+    #
+    # 返回值：nnx.filterlib.Filter，模型参数冻结过滤器
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
 
+        # filters：过滤器列表，保存多个模型参数路径过滤条件
         filters = []
+
+        # has_lora：标记当前模型是否使用 LoRA
+        # 只要 PaliGemma 或 Action Expert 中至少一个使用 LoRA，就设置为 True
         has_lora = False
 
-        # π0（Vision-Language-Action Model）
+        # π0（Vision-Language-Action Model，视觉-语言-动作模型）
         # │
-        # ├── PaliGemma（VLM）
+        # ├── PaliGemma（Vision-Language Model，视觉语言模型）
         # │   ├── SigLIP Vision Encoder（视觉编码器）
-        # │   └── Gemma 2B（语言模型）
+        # │   └── Gemma（语言模型）
         # │
         # └── Action Expert（动作专家）
-        #     └── Gemma-style Transformer（约 300M 参数）
-        
+        #     └── Gemma-style Transformer（动作建模网络）
+
+        # nnx_utils.PathRegex()：生成通过正则表达式（Regular Expression）
+        # 匹配模型参数路径的过滤器
+
+        # 1. gemma_params_filter：模型参数路径过滤器
+        #    1. 匹配以下两部分的模型参数路径：
+        #       1. PaliGemma 中 Gemma 的模型参数路径
+        #       2. Action Expert 中 Gemma 的模型参数路径
+        #    2. ".*llm.*"：匹配任意位置包含 "llm" 的模型参数路径
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
 
+        # 2. action_expert_params_filter：Action Expert 的模型参数路径过滤器
+        #    1. 只匹配 Action Expert 中 Gemma 的模型参数路径
+        #    2. ".*llm.*_1.*"：匹配包含 "llm"，且其后出现 "_1" 的模型参数路径
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+
+        # 情况一：PaliGemma 中的 Gemma 使用 LoRA
         if "lora" in self.paligemma_variant:
+
+            # 添加 gemma_params_filter：
+            # 匹配 PaliGemma 中 Gemma 和 Action Expert 中 Gemma 的模型参数路径
             filters.append(
                 gemma_params_filter,
             )
+
+            # 如果 Action Expert 中的 Gemma 不使用 LoRA
             if "lora" not in self.action_expert_variant:
-                # If only freeze gemma params, exclude action expert params.
+
+                # nnx.Not()：对过滤条件取反
+                # action_expert_params_filter：匹配 Action Expert 中 Gemma 的模型参数路径
+                # nnx.Not(action_expert_params_filter)：匹配不属于 Action Expert 中 Gemma 的参数路径
+                # 目的：从冻结范围中排除 Action Expert 中 Gemma 的参数，使其保持可训练
                 filters.append(
                     nnx.Not(action_expert_params_filter),
                 )
+
+            # 标记当前模型使用了 LoRA
+            # 无论 Action Expert 中的 Gemma 是否使用 LoRA，此处均为 True
             has_lora = True
+
+        # 情况二：PaliGemma 中的 Gemma 不使用 LoRA，而 Action Expert 中的 Gemma 使用 LoRA
         elif "lora" in self.action_expert_variant:
+
+            # 添加 action_expert_params_filter：
+            # 只匹配 Action Expert 中 Gemma 的模型参数路径
+            # 目的：冻结 Action Expert 中 Gemma 的原始模型参数
+            # 同时保留 PaliGemma 中 Gemma 的原始参数可训练
             filters.append(
                 action_expert_params_filter,
             )
+
+            # 标记当前模型使用了 LoRA
             has_lora = True
 
+        # 如果 PaliGemma 中的 Gemma 或 Action Expert 中的 Gemma 至少有一个使用 LoRA
         if has_lora:
-            # If any lora is used, exclude all lora params.
+
+            # nnx_utils.PathRegex(".*lora.*")：匹配包含 "lora" 的模型参数路径
+            # nnx.Not()：对过滤条件取反，匹配不包含 "lora" 的模型参数路径
+            # 目的：从冻结范围中排除 LoRA 参数，使 LoRA 参数保持可训练
+            # 最终只冻结使用 LoRA 的 Gemma 模型中的原始权重
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
+
+        # 如果过滤器列表为空，说明两部分 Gemma 均不使用 LoRA
         if not filters:
+
+            # nnx.Nothing：不匹配任何模型参数路径的过滤器
+            # 表示不通过该过滤器冻结任何模型参数
             return nnx.Nothing
+
+        # *filters：将过滤器列表展开为多个位置参数
+        # nnx.All(*filters)：将所有过滤条件组合为一个过滤器，只有同时满足全部过滤条件的模型参数路径才会被匹配
+        # 返回值：多个不同过滤器组合后的模型参数冻结过滤器，而不是模型参数本身
         return nnx.All(*filters)
