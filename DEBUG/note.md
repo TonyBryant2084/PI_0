@@ -1,3 +1,20 @@
+    # 结构描述：
+    # 1. SigLIP（Sigmoid Loss for Language-Image Pre-training）：包含视觉编码器（Vision Encoder）和文本编码器（Text Encoder），用于图像与文本的语义对齐。PaliGemma 只使用其中的视觉编码器。
+    # 2. Gemma：包含 Token Embedding、Transformer Blocks（Attention、MLP、RMSNorm 等）、Final RMSNorm 和 Language Modeling Head，用于语言建模与文本生成。
+    # 3. PaliGemma：使用 SigLIP 的视觉编码器，以及 Gemma 的语言模型主体（包括 Token Embedding、Transformer Blocks 和语言输出相关组件），并通过视觉投影层连接两者，构成视觉语言模型（VLM）。
+    # 4. Action Expert：主要使用 Gemma 的 Transformer 架构（Attention、MLP、RMSNorm 等），但采用独立权重，并配合动作输入投影和动作输出层，实现 Flow Matching 动作预测。
+    # 一句话总结：PaliGemma = SigLIP 视觉编码器 + Gemma 语言模型 + 视觉投影层；Action Expert = Gemma 风格 Transformer + 动作相关模块。
+    # 
+    # π0（Vision-Language-Action Model）
+    # │
+    # ├── PaliGemma（VLM）
+    # │   ├── SigLIP Vision Encoder（视觉编码器）
+    # │   └── Gemma 2B（语言模型）
+    # │
+    # └── Action Expert（动作专家）
+    #     └── Gemma-style Transformer（约 300M 参数）
+
+
 注释关键词：按照 OpenPI 源码精注格式，给我完整代码和中文注释，所有参数分行注释，补全 Shape、英文全称、计算过程和具体示例，保证内容完整但尽量精简
 
 1. 创建实例对象时：

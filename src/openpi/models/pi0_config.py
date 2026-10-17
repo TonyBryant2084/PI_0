@@ -101,14 +101,25 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
 
+    # @property：将方法转换为属性，使其可以像访问成员变量一样访问，无需添加 ()
     @property
+    # @override：标记该方法重写（Override）了父类中的方法，供类型检查工具检查
     @override
+    # 获取当前模型的类型（Model Type）  
     def model_type(self) -> _model.ModelType:
+        
+        # 使用 Pi0.5 模型
         if self.pi05:
+
+            # 返回 Pi0.5 模型类型
             return _model.ModelType.PI05
+
+        # 返回 Pi0 模型类型    
         return _model.ModelType.PI0
 
+    # @override：标记该方法重写（Override）了父类中的方法，供类型检查工具检查
     @override
+    # 创建 Pi0 模型
     def create(
         self, 
         # 随机数密钥
@@ -125,36 +136,94 @@ class Pi0Config(_model.BaseModelConfig):
             rngs=nnx.Rngs(rng)
         )
 
+    # @override：标记该方法重写（Override）了父类中的方法，供类型检查工具检查
     @override
-    def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
+    # inputs_spec（Input Specification）：返回模型输入的抽象数据规格
+    # Observation 和 Actions 中的张量均由 jax.ShapeDtypeStruct 描述，仅包含 shape 和 dtype，没有真实数据    
+    def inputs_spec(
+        self, 
+        *, 
+        batch_size: int = 1
+    ) -> tuple[_model.Observation, _model.Actions]:
+
+        # 图像输入数据规格：[batch_size, heigh(224), width(224), channels(3)]
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        # 图像掩码数据规格：[batch_size]
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        # with at.disable_typechecking()：临时禁用运行时类型检查
+        # with：仅在代码块内部禁用，退出后恢复原来的类型检查状态
+        #
+        # 原因：
+        # 1. @at.typecheck：启用运行时类型检查（Runtime Type Checking）
+        #    1. 只能直接装饰类和函数，不能直接装饰普通变量或类型别名
+        #    2. 装饰类：创建实例时，检查字段是否符合类型注解，
+        #       包括数组类型（Array Type）、数据类型（dtype）和形状（shape）
+        #    3. 装饰函数：调用时检查输入参数，返回时检查返回值是否符合类型注解，
+        #       包括数组类型（Array Type）、数据类型（dtype）和形状（shape）
+        #    注意：具体检查内容取决于类型注解及检查器的实现
+        #
+        # 2. _model.Observation 类使用了 @at.typecheck 装饰器，
+        #    因此创建 Observation 实例时，会检查字段是否符合类型注解。
+        #
+        # 3. Observation 的 ArrayT 约束为：
+        #    jax.Array | torch.Tensor | np.ndarray
+        #    但 inputs_spec() 使用的是 jax.ShapeDtypeStruct，
+        #    它只描述数组的 shape 和 dtype，不包含真实数组数据，
+        #    也不属于上述 ArrayT 允许的数组类型。
+        #
+        # 4. 因此，创建 Observation 实例时，需要临时禁用运行时类型检查，
+        #    以允许使用 jax.ShapeDtypeStruct 构建抽象输入规格。
         with at.disable_typechecking():
+
+            # 创建 机器人观测数据实例
             observation_spec = _model.Observation(
+
+                # 图像输入
                 images={
                     "base_0_rgb": image_spec,
                     "left_wrist_0_rgb": image_spec,
                     "right_wrist_0_rgb": image_spec,
                 },
+                # 图像掩码
                 image_masks={
                     "base_0_rgb": image_mask_spec,
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
                 },
+
+                # 机器人状态：[batch_size, action_dim]
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+
+                # 语言 token：[batch_size, seq_len]
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
+
+                # 语言 token 掩码：[batch_size, seq_len]
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
+
+        # 此时创建 action_spec 时没有调用 _model.Action 类别名，而且类别名不使用 @at.typecheck 装饰器，所以不会检查返回值的类型注解，包括数组类型（Array Type）、数据类型（dtype）和形状（shape），故不需要临时禁用运行时类型检查
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
+        # 返回模型输入的抽象数据规格
         return observation_spec, action_spec
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
-        """Returns the freeze filter based on the model config."""
+
         filters = []
         has_lora = False
+
+        # π0（Vision-Language-Action Model）
+        # │
+        # ├── PaliGemma（VLM）
+        # │   ├── SigLIP Vision Encoder（视觉编码器）
+        # │   └── Gemma 2B（语言模型）
+        # │
+        # └── Action Expert（动作专家）
+        #     └── Gemma-style Transformer（约 300M 参数）
+        
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
         if "lora" in self.paligemma_variant:
             filters.append(
