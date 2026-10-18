@@ -8,7 +8,13 @@
             "program": "${workspaceFolder}/DEBUG/forward.py",
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
-            "python": "${workspaceFolder}/.venv/bin/python",
+
+            // 1. for .venv python
+            // "python": "${workspaceFolder}/.venv/bin/python",
+
+            // 2. for conda python
+            "python": "D:\\Machine_Learning\\Anaconda\\envs\\openpi_debug\\python.exe",
+
             "env": {
                 "PYTHONPATH": "${workspaceFolder}/src"
             },

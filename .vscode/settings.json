@@ -15,5 +15,7 @@
         "/opt/ros/jazzy/opt/gz_msgs_vendor/lib/python",
         "/opt/ros/jazzy/opt/gz_math_vendor/lib/python",
         "/opt/ros/jazzy/lib/python3.12/site-packages"
-    ]
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
 }

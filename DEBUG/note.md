@@ -25,22 +25,67 @@
 
 3. 执行模型计算时
 
-#######################################
-# 步骤
-#######################################
+# 步骤：
+# windows:
+    # 1. 创建并激活 Conda 环境
+    conda create -n openpi_debug python=3.11 -y
+    conda activate openpi_debug
 
-conda create -n openpi_debug python=3.11 -y
-conda activate openpi_debug
-python -m pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
+    # 2. 安装 uv
+    python -m pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Physical-Intelligence/openpi.git
-cd openpi
-export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
-export UV_HTTP_TIMEOUT=120
-uv sync --no-install-project
+    # 3. 克隆 OpenPI 官方仓库（跳过 Git LFS 大文件）
+    $env:GIT_LFS_SKIP_SMUDGE = "1"
+    git clone https://github.com/Physical-Intelligence/openpi.git
 
-git remote add personal git@github.com:TonyBryant2084/PI_0.git
-git clone git@github.com:TonyBryant2084/PI_0.git
+    # 4. 进入项目目录
+    cd openpi
+
+    # 5. 配置 uv 清华镜像和超时时间
+    $env:UV_DEFAULT_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    $env:UV_HTTP_TIMEOUT = "120"
+
+    # 6. 指定 uv 使用当前 Conda 环境
+    $env:UV_PROJECT_ENVIRONMENT = $env:CONDA_PREFIX
+
+    # 7. 修改 pyproject.toml 中的 Windows 依赖后，安装项目依赖
+    uv sync --no-install-project
+
+    # 8. 添加个人 GitHub 远程仓库
+    git remote add personal git@github.com:TonyBryant2084/PI_0.git
+
+    # 9. 查看远程仓库
+    git remote -v
+
+# Linux:
+    # 1. 创建并激活 Conda 环境
+    conda create -n openpi_debug python=3.11 -y
+    conda activate openpi_debug
+
+    # 2. 安装 uv
+    python -m pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+    # 3. 克隆 OpenPI 官方仓库（跳过 Git LFS 大文件）
+    GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/Physical-Intelligence/openpi.git
+
+    # 4. 进入项目目录
+    cd openpi
+
+    # 5. 配置 uv 清华镜像和超时时间
+    export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+    export UV_HTTP_TIMEOUT=120
+
+    # 6. 指定 uv 使用当前 Conda 环境
+    export UV_PROJECT_ENVIRONMENT="$CONDA_PREFIX"
+
+    # 7. 安装 OpenPI 项目依赖
+    uv sync --no-install-project
+
+    # 8. 添加个人 GitHub 远程仓库
+    git remote add personal git@github.com:TonyBryant2084/PI_0.git
+
+    # 9. 查看远程仓库
+    git remote -v
 
 # SSH
 ssh-keygen -t ed25519 -C "tonybryant2084@gmail.com"

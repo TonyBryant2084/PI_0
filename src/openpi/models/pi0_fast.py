@@ -155,7 +155,7 @@ class Pi0FAST(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
-
+    # @at.typecheck：类型检查装饰器，用于检查函数调用时的输入参数以及函数返回值是否符合声明的类型和形状要求
     @at.typecheck
     def embed_inputs(
         self, obs: _model.Observation

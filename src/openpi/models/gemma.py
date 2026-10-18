@@ -1123,14 +1123,14 @@ class Module(nn.Module):
         # 为每个 Expert 模块创建一个独立的 RMSNorm 模块，并将所有的 RMSNorm 模块保存在列表中
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
-    # @at.typecheck 是一个类型检查装饰器，用于检查函数调用是否符合声明的类型要求。
+    # @at.typecheck：类型检查装饰器，用于检查函数调用时的输入参数以及函数返回值是否符合声明的类型和形状要求
     @at.typecheck
     # tokens：[batch_size, seq_len]
     # return：[batch_size, seq_len, embed_dim]
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
-    # @at.typecheck 是一个类型检查装饰器，用于检查函数调用是否符合声明的类型要求。
+    # @at.typecheck：类型检查装饰器，用于检查函数调用时的输入参数以及函数返回值是否符合声明的类型和形状要求
     @at.typecheck
     def __call__(
         self,

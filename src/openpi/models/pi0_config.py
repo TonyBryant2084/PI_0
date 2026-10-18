@@ -147,8 +147,11 @@ class Pi0Config(_model.BaseModelConfig):
     ) -> tuple[_model.Observation, _model.Actions]:
 
         # 图像输入数据规格：[batch_size, heigh(224), width(224), channels(3)]
+        # eg: [batch_size(1), heigh(224), width(224), channels(3)]
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+
         # 图像掩码数据规格：[batch_size]
+        # eg: [batch_size(1)]
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         # with at.disable_typechecking()：临时禁用运行时类型检查
@@ -181,31 +184,100 @@ class Pi0Config(_model.BaseModelConfig):
 
                 # 图像输入
                 images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
+                    "base_0_rgb": image_spec,        # eg: [batch_size(1), heigh(224), width(224), channels(3)]
+                    "left_wrist_0_rgb": image_spec,  # eg: [batch_size(1), heigh(224), width(224), channels(3)]
+                    "right_wrist_0_rgb": image_spec, # eg: [batch_size(1), heigh(224), width(224), channels(3)]
                 },
                 # 图像掩码
                 image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
+                    "base_0_rgb": image_mask_spec,        # eg: [batch_size(1)]
+                    "left_wrist_0_rgb": image_mask_spec,  # eg: [batch_size(1)]
+                    "right_wrist_0_rgb": image_mask_spec, # eg: [batch_size(1)]
                 },
 
                 # 机器人状态：[batch_size, action_dim]
+                # eg: [batch_size(1), action_dim(32)]
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
 
                 # 语言 token：[batch_size, seq_len]
+                # eg: [batch_size(1), max_token_len(48)]
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
 
                 # 语言 token 掩码：[batch_size, seq_len]
+                # eg: [batch_size, max_token_len(48)]
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
 
         # 此时创建 action_spec 时没有调用 _model.Action 类别名，而且类别名不使用 @at.typecheck 装饰器，所以不会检查返回值的类型注解，包括数组类型（Array Type）、数据类型（dtype）和形状（shape），故不需要临时禁用运行时类型检查
+        # eg: [batch_size(1), action_horizon(50), action_dim(32)]
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
         # 返回模型输入的抽象数据规格
+
+        # 1. observation_spec
+        #   batch_size = 1
+        #   height = 224
+        #   width = 224
+        #   channels = 3
+        #   state_dimension = 32
+        #   seq_len = 48
+        #
+        # observation = Observation(
+        #     # 图像数据：包含 3 路摄像头的 RGB 图像
+        #     # 每张图像的形状为 [batch_size, height, width, channels]
+        #     # base_0_rgb        ：[1, 224, 224, 3]，机器人基座视角
+        #     # left_wrist_0_rgb  ：[1, 224, 224, 3]，左腕部摄像头视角
+        #     # right_wrist_0_rgb ：[1, 224, 224, 3]，右腕部摄像头视角
+        #
+        #     images={
+        #         "base_0_rgb": ...,        # [1, 224, 224, 3]
+        #         "left_wrist_0_rgb": ...,  # [1, 224, 224, 3]
+        #         "right_wrist_0_rgb": ..., # [1, 224, 224, 3]
+        #     },
+        #
+        #     # 图像掩码：标记对应摄像头的图像是否有效
+        #     # 每个掩码的形状为 [batch_size]
+        #     # True 表示图像有效，False 表示图像无效
+        #
+        #     image_masks={
+        #         "base_0_rgb": ...,        # [1]
+        #         "left_wrist_0_rgb": ...,  # [1]
+        #         "right_wrist_0_rgb": ..., # [1]
+        #     },
+        #
+        #     # 机器人状态：[batch_size, state_dimension]
+        #     # 例如 [1, 32]，表示 1 个样本，每个样本包含 32 维机器人状态
+        #     # 状态可以包含关节位置等信息，具体取决于数据预处理方式
+        #
+        #     state=...,  # [1, 32]
+        #
+        #     # 语言 token：[batch_size, seq_len]
+        #     # 例如 [1, 48]，表示 1 条经过分词和填充的语言指令
+        #     # 每个整数代表词表中的一个 token ID
+        #
+        #     tokenized_prompt=...,  # [1, 48]
+        #
+        #     # 语言 token 掩码：[batch_size, seq_len]
+        #     # True 表示对应位置的 token 有效，False 表示对应位置是填充等无效位置
+        #
+        #     tokenized_prompt_mask=...,  # [1, 48]
+        #
+        #     # π0-FAST 专用字段；普通 π0 通常不需要提供
+        #
+        #     # Token 自回归掩码：[batch_size, seq_len]
+        #     # 用于控制 token 之间的自回归关系
+        #
+        #     token_ar_mask=None,  # None
+        #
+        #     # Token 损失掩码：[batch_size, seq_len]
+        #     # 用于指定哪些 token 参与损失计算
+        #
+        #     token_loss_mask=None,  # None
+        # )
+
+        # 2. action_spec = Action(
+        #    [batch_size(1), action_horizon(50), action_dim(32)]
+        # )
         return observation_spec, action_spec
 
     # get_freeze_filter()：生成模型参数冻结过滤器

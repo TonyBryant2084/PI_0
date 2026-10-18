@@ -132,7 +132,7 @@ def init_train_state(
 
     return train_state, state_sharding
 
-
+# @at.typecheck：类型检查装饰器，用于检查函数调用时的输入参数以及函数返回值是否符合声明的类型和形状要求
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -142,7 +142,7 @@ def train_step(
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
-
+    # @at.typecheck：类型检查装饰器，用于检查函数调用时的输入参数以及函数返回值是否符合声明的类型和形状要求
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
