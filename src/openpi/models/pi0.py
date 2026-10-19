@@ -15,52 +15,241 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+# make_attn_mask()：根据注意力可见性和 Token 有效性生成最终的 Attention Mask
+#
+# prefix_len：Prefix Token 的总长度
+# 1. 有语言 Token：3 * patch_len + seq_len
+# 2. 没有语言 Token：3 * patch_len
+#
+# suffix_len：Suffix Token 的总长度
+# 1. 有状态 Token：1 + action_horizon
+# 2. 没有状态 Token：action_horizon
+#
+# 参数：
+# input_mask：[batch_size, prefix_len + suffix_len]
+#   True：有效 Token
+#   False：Padding Token
+#
+# ar_mask：[prefix_len + suffix_len]
+#   True：当前 Token 开始新的 Attention 分组
+#   False：当前 Token 与前一个 Token 属于同一 Attention 分组
+#
+# 返回：[batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
+#   True：允许 Query Token 关注 Key Token
+#   False：禁止 Query Token 关注 Key Token
 
-def make_attn_mask(input_mask, mask_ar):
-    """Adapted from big_vision.
+def make_attn_mask(
+    input_mask,
+    ar_mask,
+):
+    # 将 ar_mask 广播到与 input_mask 相同的形状
+    # ar_mask：[prefix_len + suffix_len] -> [batch_size, prefix_len + suffix_len]
+    ar_mask = jnp.broadcast_to(ar_mask, input_mask.shape)
 
-    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
-    setup several types of attention, for example:
+    # jnp.cumsum(...): 布尔值会按照数值参与累积求和，True = 1，False = 0
+    #
+    # 沿 Token 序列维度进行累积求和，确定每个 Token 所属的 Attention 分组
+    # 1. 累积值相同的 Token 属于同一组，可以相互关注
+    # 2. 当前 Token 可以关注累积值小于或等于自己的 Token
+    # 3. 当前 Token 不能关注累积值大于自己的 Token
+    #
+    # Eg:
+    # ar_mask = [0, 0, 1, 0]
+    # cumsum  = [0, 0, 1, 1]
+    #
+    # cumsum：[batch_size, prefix_len + suffix_len]
+    cumsum = jnp.cumsum(ar_mask, axis=1)
 
-      [[1 1 1 1 1 1]]: pure causal attention.
-
-      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-          themselves and the last 3 tokens have a causal attention. The first
-          entry could also be a 1 without changing behaviour.
-
-      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-          block can attend all previous blocks and all tokens on the same block.
-
-    Args:·
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
-        it and false where it shares the same attention mask as the previous token.
-    """
-    mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
-    cumsum = jnp.cumsum(mask_ar, axis=1)
+    # 1. 注意力可见性（Attention Visibility）
+    #    根据自回归分组规则，判断 Query Token 是否允许关注 Key Token
+    #
+    # cumsum[:, None, :]：[batch_size, 1, prefix_len + suffix_len]
+    #   表示 Key Token 所属的 Attention 分组
+    # cumsum[:, :, None]：[batch_size, prefix_len + suffix_len, 1]
+    #   表示 Query Token 所属的 Attention 分组
+    #
+    # cumsum[:, None, :] <= cumsum[:, :, None]：
+    # 1. 广播为 [batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
+    # 2. 逐位置比较，若 Key 分组 <= Query 分组则为 True，否则为 False
+    #
+    # Eg：取出某个 batch（用 1/0 表示 True/False）
+    #     1. cumsum = [0, 0, 1, 1]
+    #     2. attn_mask = [
+    #         [1, 1, 0, 0],
+    #         [1, 1, 0, 0],
+    #         [1, 1, 1, 1],
+    #         [1, 1, 1, 1]
+    #     ]
+    #     3. attn_mask[0, 1] == 1：0 号 Token 可以关注 1 号 Token
+    #     4. attn_mask[0, 2] == 0：0 号 Token 不能关注 2 号 Token
+    #
+    # 行：Query Token（关注方）
+    # 列：Key Token（被关注方）
+    #
+    # attn_mask：[batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
+
+    # 2. Token 有效性（Token Validity）
+    #    判断 Query Token 和 Key Token 是否均为有效 Token，而非 Padding Token
+    #
+    # input_mask[:, None, :]：[batch_size, 1, prefix_len + suffix_len]
+    #   表示 Key Token 是否有效
+    # input_mask[:, :, None]：[batch_size, prefix_len + suffix_len, 1]
+    #   表示 Query Token 是否有效
+    #
+    # input_mask[:, None, :] * input_mask[:, :, None]：
+    # 1. 广播为 [batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
+    # 2. 逐位置相乘，只有 Query 和 Key 均有效时结果才为 True
+    #
+    # Eg：取出某个 batch（用 1/0 表示 True/False）
+    #     1. input_mask = [1, 1, 0, 1]
+    #     2. valid_mask = [
+    #         [1, 1, 0, 1],
+    #         [1, 1, 0, 1],
+    #         [0, 0, 0, 0],
+    #         [1, 1, 0, 1]
+    #     ]
+    #     3. valid_mask[0, 1] == 1：0 号和 1 号 Token 均有效，具备相互关注的资格
+    #     4. valid_mask[0, 2] == 0：2 号 Token 无效，0 号 Token 不能关注它
+    #     5. valid_mask[2, :] == [0, 0, 0, 0]：2 号 Token 无效，不能作为有效 Query 关注任何 Token
+    #
+    # 行：Query Token（关注方）
+    # 列：Key Token（被关注方）
+    #
+    # valid_mask：[batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
+
+    # 3. 综合判断：注意力可见性 + Token 有效性
+    # jnp.logical_and()：Logical AND（逻辑与），逐位置进行逻辑与运算
+    # 只有同时满足以下条件，最终结果才为 True：
+    # 1. attn_mask == True：Attention 分组规则允许 Query 关注 Key
+    # 2. valid_mask == True：Query 和 Key 均为有效 Token
+    #
+    # 返回：[batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
     return jnp.logical_and(attn_mask, valid_mask)
 
 
+# @at.typecheck：检查函数输入参数和返回值是否符合声明的类型及形状要求
 @at.typecheck
+# 将每个样本的 Flow Matching 时间 timestep（标量）转换为长度为 action_expert_width 的正弦-余弦时间嵌入向量 time_emb，让 Action Expert 能够利用当前时间信息
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+    # pos：[batch_size]，每个样本对应的 Flow Matching 时间 t
+    # 在 π0 的训练阶段，pos 对应的就是 timestep，它是随机采样的，而且 Batch 中每个样本都有一个独立的时间值
+    pos: at.Real[at.Array, " b"],
+
+    # embedding_dim：时间嵌入向量的维度
+    # 在 π0 中：embedding_dim = action_expert_width
+    embedding_dim: int,
+
+    # min_period：最小周期，例如 4e-3 = 0.004
+    min_period: float,
+
+    # max_period：最大周期，例如 4.0
+    max_period: float,
+
+# 返回：[batch_size, embedding_dim]，正弦-余弦时间嵌入向量
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+
+    # 检查 embedding_dim 是否为偶数，因为一半维度用于 sin，另一半维度用于 cos
+    # 例如：embedding_dim = 8，则 sin 和 cos 各占 4 维
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
+
+    # 生成归一化的周期分布位置
+    #
+    # embedding_dim // 2：需要生成的周期数量
+    # jnp.linspace(0.0, 1.0, embedding_dim // 2)：
+    #   在 [0, 1] 范围内生成 embedding_dim // 2 个等间隔数值
+    #
+    # 例如：embedding_dim = 8
+    # fraction：[4] = [0.0, 0.3333, 0.6667, 1.0]
+    #
+    # fraction：[embedding_dim // 2]
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
+
+    # 根据 fraction 生成从 min_period 到 max_period 的周期
+    #
+    # period = min_period * (max_period / min_period) ** fraction
+    #
+    # 当 fraction = 0：
+    #   period = min_period
+    #
+    # 当 fraction = 1：
+    #   period = max_period
+    #
+    # 中间周期按照几何比例分布，而不是线性分布
+    #
+    # 例如：embedding_dim = 8，min_period = 0.004，max_period = 4.0
+    # fraction = [0.0, 1/3, 2/3, 1.0]
+    # period   = [0.004, 0.04, 0.4, 4.0]
+    #
+    # period：[embedding_dim // 2]
     period = min_period * (max_period / min_period) ** fraction
+
+
+    # 将每个时间 t 与不同周期对应的角频率相乘
+    #
+    # 角频率 omega = 2π / period
+    #
+    # pos：[batch_size]
+    # period：[embedding_dim // 2]
+    # omega = 2π / period：[embedding_dim // 2]
+    #
+    # jnp.einsum("i,j->ij", pos, 2π / period)：
+    #   计算两个一维向量的外积
+    #   每个样本的时间 t 都与全部角频率相乘
+    #
+    # 例如：batch_size = 2，embedding_dim = 8
+    #
+    # pos = [0.5, 1.0]
+    # period = [0.004, 0.04, 0.4, 4.0]
+    #
+    # 1. 计算每个周期对应的角频率：
+    #    2π / period = [500π, 50π, 5π, 0.5π]
+    #    Shape：[embedding_dim // 2] = [4]
+    #
+    # 2. jnp.einsum("i,j->ij", pos, 2π / period)：
+    #    将每个时间 t 与全部角频率相乘，计算两个一维向量的外积
+    #
+    #    sinusoid_input =
+    #    [
+    #        [250π, 25π, 2.5π, 0.25π],  # t = 0.5
+    #        [500π, 50π, 5π,   0.5π ]   # t = 1.0
+    #    ]
+    #
+    # sinusoid_input：[batch_size, embedding_dim // 2] = [2, 4]
     sinusoid_input = jnp.einsum(
         "i,j->ij",
         pos,
         1.0 / period * 2 * jnp.pi,
+        # precision：Precision（计算精度），指定 jnp.einsum() 内部乘法和累加运算的精度
+        # jax.lax.Precision.HIGHEST：请求使用当前计算平台支持的最高乘法精度，
+        # 以减少浮点数计算误差，但不改变输入、输出的数据类型（dtype）
         precision=jax.lax.Precision.HIGHEST,
     )
-    return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
+
+    # 分别计算 sin 和 cos，再沿最后一个维度拼接
+    #
+    # jnp.sin(sinusoid_input)：
+    #   [batch_size, embedding_dim // 2]
+    #
+    # jnp.cos(sinusoid_input)：
+    #   [batch_size, embedding_dim // 2]
+    #
+    # jnp.concatenate(..., axis=-1)：
+    #   沿最后一个维度拼接 sin 和 cos
+    #
+    # 例如：embedding_dim = 8
+    #   前 4 维：sin(t * 2π / period)
+    #   后 4 维：cos(t * 2π / period)
+    #
+    # 返回 time_emb：[batch_size, embedding_dim]
+    # 在 π0 中：[batch_size, action_expert_width]
+    return jnp.concatenate(
+        [jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)],
+        axis=-1,
+    )
 
 # PI0 模型
 class Pi0(_model.BaseModel):
@@ -571,10 +760,10 @@ class Pi0(_model.BaseModel):
         # timestep：[batch_size]
         # time_emb：[batch_size, action_expert_width]
         time_emb = posemb_sincos(
-            timestep,
-            self.action_in_proj.out_features,  # 嵌入维度：action_expert_width
-            min_period=4e-3,                   # 最小周期
-            max_period=4.0,                    # 最大周期
+            pos = timestep,
+            embedding_dim = self.action_in_proj.out_features,  # 嵌入维度：action_expert_width
+            min_period = 4e-3,                   # 最小周期
+            max_period = 4.0,                    # 最大周期
         )
 
         # 4. 根据模型类型选择时间信息的注入方式
@@ -763,6 +952,8 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # 前缀编码：将摄像头图像 + 语言 Token 编码为 PaliGemma 中 Gemma 的输入特征
+        # 带语言token: prefix_len = 3 * patch_len + seq_len
+        # 不带语言token: prefix_len = 3 * patch_len
         # prefix_tokens：[batch_size, prefix_len, paligemma_width]
         # prefix_mask：[batch_size, prefix_len]
         # prefix_ar_mask：[prefix_len]
@@ -771,7 +962,9 @@ class Pi0(_model.BaseModel):
         # 后缀编码：将机器人状态（普通 π0）+ 加噪动作 x_t + 时间信息编码为 Action Expert 中 Gemma 的输入特征
         # 普通 π0：将时间嵌入与动作 Token 拼接，再通过 MLP 融合，直接将时间信息注入动作特征
         # π0.5：不将时间嵌入拼接到动作 Token，而是将时间嵌入经过时间 MLP 处理后，编码为 AdaRMSNorm 的条件向量
-        #
+        # 
+        # 带状态: suffix_len = 1 + action_horizon
+        # 不带状态: suffix_len = action_horizon
         # suffix_tokens：[batch_size, suffix_len, action_expert_width]
         # suffix_mask：[batch_size, suffix_len]
         # suffix_ar_mask：[suffix_len]
@@ -793,62 +986,186 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
 
         # 根据前后缀编码的 有效性掩码 和 注意力分组标记 构造实际的注意力掩码
+        # input_mask: [batch_size, prefix_len + suffix_len]
+        # ar_mask = [prefix_len + suffix_len]
+        # attn_mask: [batch_size, prefix_len + suffix_len, prefix_len + suffix_len]
         attn_mask = make_attn_mask(input_mask, ar_mask)
 
-
+        # 给 token 进行位置编号
+        # 1. 保证第一个有效 Token 的位置索引一定为 0，无论前面是否存在 Padding Token
+        # 2. 保证后续有效 Token 的位置索引连续递增，Padding Token | 无效 token 不占用位置编号
+        # input_mask: [batch_size, prefix_len + suffix_len]
+        # jnp.cumsum(...): 布尔值会按照数值参与累积求和，True = 1，False = 0
         positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        # 训练阶段：通过 Prefix + Suffix 的联合 Attention 提取特征
+        # Attention([Q_prefix, Q_suffix], [K_prefix, K_suffix], [V_prefix, V_suffix])
+        # prefix_out: [batch_size, prefix_len, paligemma_width]
+        # suffix_out: [batch_size, suffix_len, action_expert_width]
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
+
+        # suffix_out[:, -self.action_horizon :]：[batch_size, action_horizon, action_expert_width]
+        # 1. suffix_out：[batch_size, suffix_len, action_expert_width]
+        # 2. -self.action_horizon：选取最后 action_horizon 个 Token
+        #    1) π0：Suffix 包含 1 个 State Token 和 action_horizon 个 Action Token，
+        #       suffix_len = 1 + action_horizon，因此需要排除第一个 State Token
+        #    2) π0.5：State 作为离散 Token 输入 Prefix，Suffix 仅包含 Action Token，
+        #       suffix_len = action_horizon，因此直接选取全部 Action Token
+        # self.action_out_proj(...): [batch_size, suffix_len, action_dim]
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        # Flow Matching 均方误差
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     @override
     def sample_actions(
         self,
+        # rng: 随机数秘钥，用于生成初始高斯噪声
         rng: at.KeyArrayLike,
+        # observation: 机器人观测数据
         observation: _model.Observation,
         *,
+        # Flow Matching 推理的积分步数，默认为 10 步
         num_steps: int | at.Int[at.Array, ""] = 10,
+        # 初始的高斯噪声，可由外部传入
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+
+        # 预处理机器人观测数据
         observation = _model.preprocess_observation(None, observation, train=False)
-        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
-        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
+
+        # 计算积分步长
+        # t == 1: A_t = noise
+        # t == 0: A_t = real Action
+        # dt = -1.0 / 10 = -0.1 即每次走 -0.1 步长
         dt = -1.0 / num_steps
+
+        # 获取 batch_size
         batch_size = observation.state.shape[0]
+
+        # 如果没有传入噪声，则随机生成标准高斯噪声
         if noise is None:
+
+            # noise: [batch_size, action_horizon, action_dim]
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
+        # 前缀编码：将摄像头图像 + 语言 Token 编码为 PaliGemma 中 Gemma 的输入特征
+        # 带语言token: prefix_len = 3 * patch_len + seq_len
+        # 不带语言token: prefix_len = 3 * patch_len
+        # prefix_tokens：[batch_size, prefix_len, paligemma_width]
+        # prefix_mask：[batch_size, prefix_len]
+        # prefix_ar_mask：[prefix_len]
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # 注意力机制掩码 prefix_attn_mask: [batch_size, prefix_len]
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        
+        # 给 token 进行位置编号
+        # 1. 保证第一个有效 Token 的位置索引一定为 0，无论前面是否存在 Padding Token
+        # 2. 保证后续有效 Token 的位置索引连续递增，Padding Token | 无效 token 不占用位置编号
+        # prefix_mask：[batch_size, prefix_len]
+        # jnp.cumsum(...): 布尔值会按照数值参与累积求和，True = 1，False = 0
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+
+        # 只计算 Prefix 的 Self-Attention
+        # kv_cache = (key_cache, value_cache)
+        #
+        # key_cache, value_cache：[depth, batch_size, prefix_len, num_kv_heads, head_dim]
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        # 根据当前带噪动作 x_t，预测动作变化的速度 v_t，然后沿着速度方向更新动作，使其逐渐从高斯噪声变成机器人可以执行的动作
+        # carry = (x_t, time)
+        # x_t: [batch_size, action_horizon, action_dim] 当前带噪声的动作
+        # time: 当前的积分时间 t，初始值为 1
         def step(carry):
+            # x_t: [batch_size, action_horizon, action_dim] 当前带噪声的动作
+            # time: 当前的积分时间 t，初始值为 1
             x_t, time = carry
+
+            # 后缀编码：将机器人状态（普通 π0）+ 加噪动作 x_t + 时间信息编码为 Action Expert 中 Gemma 的输入特征
+            # 普通 π0：将时间嵌入与动作 Token 拼接，再通过 MLP 融合，直接将时间信息注入动作特征
+            # π0.5：不将时间嵌入拼接到动作 Token，而是将时间嵌入经过时间 MLP 处理后，编码为 AdaRMSNorm 的条件向量
+            # 
+            # 带状态: suffix_len = 1 + action_horizon
+            # 不带状态: suffix_len = action_horizon
+            # suffix_tokens：[batch_size, suffix_len, action_expert_width]
+            # suffix_mask：[batch_size, suffix_len]
+            # suffix_ar_mask：[suffix_len]
+            # adarms_cond（AdaRMSNorm 的条件向量）：
+            #   π0.5：[batch_size, action_expert_width]，用于将时间条件注入 Action Expert 内部的 AdaRMSNorm
+            #   普通 π0：None，时间信息已融合到动作 Token 中
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, jnp.broadcast_to(time, batch_size) # [batch_size]
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
+
+            # 后缀编码的注意力掩码 suffix_attn_mask: [batch_size, suffix_len, suffix_len]
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
+
+            # 构建 Suffix → Prefix 的注意力掩码（这里可不是 prefix token 的自注意力掩码）：
+            # 1. 注意力可见性：所有 Suffix Token 都允许关注所有 Prefix Token，无需额外限制。
+            # 2. Token 有效性：Prefix 中可能存在无效 Token，需要通过 prefix_mask 排除。
+            # 因此，只需将 prefix_mask 复制 suffix_len 次，作为 Suffix → Prefix 的注意力掩码。
+            #
+            # suffix_tokens：[batch_size, suffix_len, action_expert_width]
+            # suffix_tokens.shape[1] = suffix_len
+            # prefix_mask：[batch_size, prefix_len]
+            # prefix_attn_mask：[batch_size, suffix_len, prefix_len]
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+
+            # 构建 Suffix → Prefix + Suffix 的注意力掩码
+            #
+            # prefix_attn_mask：[batch_size, suffix_len, prefix_len]
+            # suffix_attn_mask：[batch_size, suffix_len, suffix_len]
+            #
+            # axis=-1：沿最后一个维度（Key 维度）进行拼接
+            #
+            # full_attn_mask：[batch_size, suffix_len, prefix_len + suffix_len]
+            # Query：Suffix Token
+            # Key：Prefix Token + Suffix Token
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+
+            # 断言: full_attn_mask.shape == [batch_size, suffix_len, prefix_len + suffix_len]
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+
+            # 为 Suffix Token 生成位置索引，使其接在有效 Prefix Token 后面，用于 RoPE
+            #
+            # 1. 计算每个样本有效 Prefix Token 的数量：
+            #    prefix_mask：[batch_size, prefix_len]
+            #    jnp.sum(prefix_mask, axis=-1)：[batch_size]
+            #    jnp.sum(...)[:, None]：[batch_size, 1]，方便广播
+            #
+            # 2. 为 Suffix Token 生成相对位置索引：
+            #    suffix_mask：[batch_size, suffix_len]
+            #    jnp.cumsum(suffix_mask, axis=-1) - 1：[batch_size, suffix_len]
+            #    True = 1，False = 0
+            #    (1) 保证第一个有效 Suffix Token 的相对位置索引为 0，即使前面存在 Padding Token
+            #    (2) 保证后续有效 Suffix Token 的相对位置索引连续递增，Padding Token 不增加位置计数
+            #
+            # 3. 生成 Suffix Token 在 Prefix + Suffix 序列中的最终位置索引：
+            #    将有效 Prefix Token 的数量加到 Suffix 的相对位置索引上
+            #    使第一个有效 Suffix Token 的位置紧接在最后一个有效 Prefix Token 后面
+            #
+            # positions：[batch_size, suffix_len]
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
+            # 推理阶段：计算 Suffix Token 的 Attention
+            # Attention(Q_suffix, [K_prefix, K_suffix], [V_prefix, V_suffix])
+            #
+            # Q_suffix、K_suffix、V_suffix：由当前 Suffix Token 生成
+            # K_prefix、V_prefix：从 kv_cache 中读取
+            #
+            # prefix_out：None，因为 Prefix 的 K、V 已缓存，不再计算 Prefix 输出
+            # suffix_out：[batch_size, suffix_len, action_expert_width]
+            #   π0：包含 1 个 State Token 和 action_horizon 个 Action Token 的输出特征
+            #   π0.5：仅包含 action_horizon 个 Action Token 的输出特征
+            #
+            # 注意：suffix_out 是 Transformer 输出的隐藏特征，并非预测速度场 v_t
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
@@ -856,15 +1173,92 @@ class Pi0(_model.BaseModel):
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+            # 断言 Prefix 输出为 None，因为当前只计算 Suffix
+            assert prefix_out is None
+
+            # 从 suffix_out 中提取 Action Token 的隐藏特征，并预测速度场 v_t
+            #
+            # suffix_out：[batch_size, suffix_len, action_expert_width]
+            #
+            # suffix_out[:, -self.action_horizon:]：
+            #   选取最后 action_horizon 个 Token
+            #
+            #   1. π0：
+            #      suffix_len = 1 + action_horizon
+            #      Suffix 包含 1 个 State Token 和 action_horizon 个 Action Token
+            #      因此需要排除第一个 State Token，只保留 Action Token
+            #
+            #   2. π0.5：
+            #      suffix_len = action_horizon
+            #      State 已作为离散 Token 输入 Prefix
+            #      因此直接选取全部 Action Token
+            #
+            # suffix_out[:, -self.action_horizon:]：
+            #   [batch_size, action_horizon, action_expert_width]
+            #
+            # self.action_out_proj(...)：
+            #   将 Action Token 的隐藏特征从 action_expert_width 映射到 action_dim
+            #
+            # v_t：[batch_size, action_horizon, action_dim]
+            #   表示整个动作序列在当前 Flow Matching 时间 t 下的预测速度场
+            #   不是最终动作 A，而是用于后续更新带噪动作 x_t
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+
+            # 使用 Euler（欧拉）积分法，根据预测速度场 v_t 更新动作和时间
+            #
+            # num_steps = 10，因此 dt = -1.0 / 10 = -0.1
+            #
+            # 1. x_t + dt * v_t：
+            #    x_t：[batch_size, action_horizon, action_dim]，当前带噪动作序列
+            #    v_t：[batch_size, action_horizon, action_dim]，当前预测的速度场
+            #    x_next = x_t - 0.1 * v_t
+            #    每次更新整个动作序列，经过 10 次积分，逐步从高斯噪声生成最终动作
+            #
+            # 2. time + dt：
+            #    time：当前 Flow Matching 时间，初始值为 1.0
+            #    time_next = time - 0.1
+            #    时间依次为 1.0 -> 0.9 -> 0.8 -> ... -> 0.0
+            #
+            # 每次积分都需要根据更新后的 x_t 和 time 重新预测 v_t
+            #
+            # 返回：(x_next, time_next)
+            #   x_next：[batch_size, action_horizon, action_dim]
+            #   time_next：标量
             return x_t + dt * v_t, time + dt
 
+        # 判断是否还需要继续进行欧拉积分
         def cond(carry):
+            # x_t: [batch_size, action_horizon, action_dim] 当前带噪声的动作
+            # time: 当前的积分时间 t
+            # 随着逐渐积分，t 逐渐减小 1.0 -> 0.9 -> 0.8 -> ... -> 0.2 -> 0.1 -> 0.0(完成)
             x_t, time = carry
-            # robust to floating-point error
+
+            # dt = -1.0 / 10 = -0.1
+            # -dt / 2 = 0.05 
+            # 也就是说，当 time >= 0.05 时，还没有积分完全，所以需要继续积分
             return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        # 执行 JAX 的 While 循环
+        # 执行过程（num_steps = 10，dt = -0.1）：
+        #   1. cond() 判断 time >= 0.05 是否成立
+        #   2. 成立则执行 step()，更新 x_t = x_t - 0.1 * v_t，time = time - 0.1
+        #   3. 重复执行，直到 time 接近 0，停止循环
+        #
+        # 返回值：(x_0, time)
+        #   x_0：[batch_size, action_horizon, action_dim]，经过 10 次积分生成的最终动作序列
+        #   time：标量，最终时间约为 0.0，使用 _ 忽略
+        x_0, _ = jax.lax.while_loop(
+            # 1. 循环条件函数
+            cond_fun = cond, 
+            # 2. 循环体函数
+            body_fun = step, 
+            # 3. 循环初始状态
+            init_val = (noise, 1.0)
+        )
+
+        # 返回最终预测的动作序列 x_0
+        # Flow Matching 时间 t：从 1.0 逐步减小到 0.0
+        # 经过 10 次 Euler 积分，将初始高斯噪声逐步转换为预测动作
+        # x_0：[batch_size, action_horizon, action_dim]
         return x_0
