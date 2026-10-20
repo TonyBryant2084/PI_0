@@ -936,7 +936,7 @@ class Pi0(_model.BaseModel):
         # time: [batch_size, 1, 1] 新增两个维度对应 action_horizon 和 action_dim
         time_expanded = time[..., None, None]
 
-        # 构造 Flow Matching 中间状态 x_t
+        # 构造 Flow Matching 中间动作状态 x_t
         # 1. time_expanded: [batch_size, 1, 1]
         # 2. noise: [batch_size, action_horizon, action_dim]
         # 3. actions: [batch_size, action_horizon, action_dim]
