@@ -40,12 +40,12 @@ def main():
     print("Model initialized.")
 
     # 4. 创建假观测数据
-    observation = config.fake_obs(batch_size=1)
+    observation = config.fake_obs(batch_size=5)
 
     # 5. 创建随机动作序列
     actions = jax.random.normal(
         jax.random.PRNGKey(1),
-        shape=(1, config.action_horizon, config.action_dim),
+        shape=(5, config.action_horizon, config.action_dim),
         dtype=jnp.float32,
     )
 

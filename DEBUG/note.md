@@ -27,11 +27,11 @@
 
 # 步骤：
 # windows:
-    # 1. 创建并激活 Conda 环境
+    # 1. 创建并激活 Conda 环境（使用清华 Anaconda 镜像）
     conda create -n openpi_debug python=3.11 -y
     conda activate openpi_debug
 
-    # 2. 安装 uv
+    # 2. 安装 uv（清华 PyPI 镜像）
     python -m pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
 
     # 3. 克隆 OpenPI 官方仓库（跳过 Git LFS 大文件）
@@ -41,9 +41,10 @@
     # 4. 进入项目目录
     cd openpi
 
-    # 5. 配置 uv 清华镜像和超时时间
+    # 5. 配置 uv 国内镜像、超时时间和并发下载
     $env:UV_DEFAULT_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
     $env:UV_HTTP_TIMEOUT = "120"
+    $env:UV_CONCURRENT_DOWNLOADS = "16"
 
     # 6. 指定 uv 使用当前 Conda 环境
     $env:UV_PROJECT_ENVIRONMENT = $env:CONDA_PREFIX
@@ -51,10 +52,14 @@
     # 7. 修改 pyproject.toml 中的 Windows 依赖后，安装项目依赖
     uv sync --no-install-project
 
-    # 8. 添加个人 GitHub 远程仓库
+    # 8. 配置 Git 全局用户信息（用于 Git Commit）
+    git config --global user.email "TonyBryant2084@gmail.com"
+    git config --global user.name "TonyBryant2084"
+
+    # 9. 添加个人 GitHub 远程仓库（命名为 personal）
     git remote add personal git@github.com:TonyBryant2084/PI_0.git
 
-    # 9. 查看远程仓库
+    # 10. 查看 Git 远程仓库配置
     git remote -v
 
 # Linux:
@@ -62,7 +67,7 @@
     conda create -n openpi_debug python=3.11 -y
     conda activate openpi_debug
 
-    # 2. 安装 uv
+    # 2. 安装 uv（清华 PyPI 镜像）
     python -m pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
 
     # 3. 克隆 OpenPI 官方仓库（跳过 Git LFS 大文件）
@@ -71,20 +76,25 @@
     # 4. 进入项目目录
     cd openpi
 
-    # 5. 配置 uv 清华镜像和超时时间
-    export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+    # 5. 配置 uv 国内镜像、超时时间和并发下载
+    export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
     export UV_HTTP_TIMEOUT=120
+    export UV_CONCURRENT_DOWNLOADS=16
 
     # 6. 指定 uv 使用当前 Conda 环境
     export UV_PROJECT_ENVIRONMENT="$CONDA_PREFIX"
-
-    # 7. 安装 OpenPI 项目依赖
+    
+    # 7. 修改 pyproject.toml 中的 Windows 依赖后，安装项目依赖
     uv sync --no-install-project
 
-    # 8. 添加个人 GitHub 远程仓库
+    # 8. 配置 Git 全局用户信息（用于 Git Commit）
+    git config --global user.email "TonyBryant2084@gmail.com"
+    git config --global user.name "TonyBryant2084"
+
+    # 9. 添加个人 GitHub 远程仓库（命名为 personal）
     git remote add personal git@github.com:TonyBryant2084/PI_0.git
 
-    # 9. 查看远程仓库
+    # 10. 查看 Git 远程仓库配置
     git remote -v
 
 # SSH
